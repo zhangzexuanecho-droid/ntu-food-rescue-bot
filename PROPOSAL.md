@@ -1,0 +1,5 @@
+# Dynamic Redistribution of Canteen Surplus Food (Waste Management PS2 / Food Security PS2)
+
+**Implementation:** A campus version of Too Good To Go built as a pair of Telegram bots — one student-facing, one vendor-facing — backed by a PostgreSQL database on Supabase. Food stalls publish near-expiration/discounted meals through a guided five-step flow (stall selection → meal title → pricing → quantity → pickup window), while students browse available listings and reserve meals with a tap, receiving a unique 6-character claim code to collect their meal at the stall. Access is role-based: each vendor account is linked to its own stall via `vendor_telegram_id`, while an admin role manages all stalls. Reservations decrement stock atomically to prevent overselling.
+
+**Advantages:** The use-case scenario is clear and well-defined. Telegram's chat interface serves as the front-end UI — inline keyboards replace web pages, so no separate front-end design (e.g., Figma) is required. The backend is only a few hundred lines of Python (python-telegram-bot v20 async + supabase-py), yet achieves a complete operational closed loop: publish → browse → reserve → claim with code.
