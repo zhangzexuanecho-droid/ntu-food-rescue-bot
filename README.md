@@ -5,11 +5,11 @@ A campus version of Too Good To Go for NTU: food stalls list surplus meals at a 
 ## Architecture
 
 - **Two Telegram bots** built with `python-telegram-bot` v20+ (async):
-  - `student_bot.py` — browse available meals, reserve with one tap, view my reservations
+  - `student_bot.py` — browse available meals (5 per page), reserve with one tap, view my reservations
   - `vendor_bot.py` — publish surplus meals via a five-step wizard (stall → title → prices → quantity → pickup window)
 - **Supabase (PostgreSQL)** — three tables: `stalls`, `listings`, `reservations` (`schema.sql`)
 - **Role-based access** — each vendor account is linked to its own stall via `vendor_telegram_id`; admin Telegram IDs (configured in `.env`) can manage all stalls
-- Reservations decrement stock conditionally (`WHERE quantity > 0`) to prevent overselling; unique 6-character claim codes for collection
+- Reservations decrement stock with a compare-and-swap update (`WHERE quantity = <value just read>`, retried on conflict), so concurrent reservations can't oversell; if saving the reservation fails, the portion is put back. Unique 6-character claim codes for collection
 
 ## Project layout
 
@@ -26,18 +26,24 @@ A campus version of Too Good To Go for NTU: food stalls list surplus meals at a 
 1. Create the two bots with **BotFather** (student bot + vendor bot) and note their tokens.
 2. Create a Supabase project and run `schema.sql` in the SQL Editor.
 3. Create a `.env` file (see template below).
-4. Install dependencies:
+4. Install dependencies into a virtual environment (Python 3.10+):
 
    ```bash
+   python3 -m venv .venv
+   source .venv/bin/activate
    pip install "python-telegram-bot>=20.0" "supabase>=2.0" python-dotenv
    ```
 
-5. Run the bots (two terminals):
+5. Run the bots (two terminals, each with `source .venv/bin/activate` first):
 
    ```bash
    python student_bot.py
    python vendor_bot.py
    ```
+
+   Only one instance of each bot may run at a time — a second one fails with a Telegram `Conflict` error.
+
+> Free-tier Supabase projects are paused after a week of inactivity. If the bots log DNS errors such as `nodename nor servname provided`, restore the project from the Supabase dashboard; the bots reconnect on their own.
 
 ### `.env` template
 

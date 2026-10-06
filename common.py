@@ -17,6 +17,9 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+# httpx 在 INFO 级别会打印每个请求的完整 URL，而 Bot API 的 URL 里含有 bot token；
+# 调到 WARNING，避免 token 出现在终端和日志文件里。
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 def get_supabase() -> Client:

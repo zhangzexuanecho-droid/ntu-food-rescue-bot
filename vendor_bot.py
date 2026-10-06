@@ -10,8 +10,11 @@
 """
 
 import logging
+import math
+from warnings import filterwarnings
 
 from telegram import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -21,13 +24,25 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telegram.warnings import PTBUserWarning
 
 from common import get_admin_ids, get_bot_token, get_supabase
 
 logger = logging.getLogger(__name__)
 
+# 发布流程混用 MessageHandler 与 CallbackQueryHandler，只能按 chat/user 跟踪对话状态
+# （per_message=False），这正是预期行为；屏蔽 PTB 针对这种组合的提示性警告。
+filterwarnings("ignore", message=r"If 'per_message=False'", category=PTBUserWarning)
+
 # 发布流程的五个对话状态
 (SELECT_STALL, MEAL_TITLE, PRICES, QUANTITY, PICKUP_WINDOW) = range(5)
+
+# 输入上限：标题、取餐时间太长会撑大学生端列表；价格、数量过大会超出数据库
+# numeric(10,2) / integer 的范围，要到最后一步保存时才报错
+MAX_TITLE_LEN = 60
+MAX_PICKUP_LEN = 40
+MAX_PRICE = 1000
+MAX_QUANTITY = 999
 
 # 商家端主菜单
 VENDOR_MENU = InlineKeyboardMarkup(
@@ -57,10 +72,9 @@ class VendorBot:
         )
 
     async def _fail(self, update: Update, text: str) -> None:
-        """流程入口失败时按入口类型（按钮/命令）选择回复方式。"""
+        """流程入口失败时按入口类型（按钮/命令）选择回复方式；按钮已在入口处 answer。"""
         query = update.callback_query
         if query is not None:
-            await query.answer()
             try:
                 await query.edit_message_text(text, reply_markup=VENDOR_MENU)
             except Exception:
@@ -84,6 +98,9 @@ class VendorBot:
 
     async def start_add_meal(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         """Step 1/5：加载摊位列表。普通 vendor 只见自己名下的摊位；管理员可见全部。"""
+        if update.callback_query is not None:
+            await update.callback_query.answer()  # 回调必须 answer，否则客户端按钮会一直转圈
+        context.user_data.clear()  # 允许中途重新进入流程，先清掉上次没走完的数据
         vendor_id = update.effective_user.id
         is_admin = vendor_id in get_admin_ids()
         try:
@@ -118,7 +135,9 @@ class VendorBot:
             )
             return MEAL_TITLE
 
-        # 名下多个摊位：列出供选择
+        # 名下多个摊位：列出供选择，并记下可选范围供 select_stall 校验
+        # （callback_data 可被恶意客户端伪造，不能直接信任按钮里的 stall id）
+        context.user_data["stalls"] = {s["id"]: s for s in stalls}
         keyboard = [
             [
                 InlineKeyboardButton(
@@ -138,20 +157,38 @@ class VendorBot:
         return SELECT_STALL
 
     async def select_stall(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """记录所选摊位，询问餐品名称。"""
+        """校验并记录所选摊位，询问餐品名称。"""
         query = update.callback_query
         await query.answer()
-        context.user_data["stall_id"] = query.data.split(":", 1)[1]
+        stall = context.user_data.get("stalls", {}).get(query.data.split(":", 1)[1])
+        if stall is None:
+            context.user_data.clear()
+            await query.edit_message_text(
+                "🔒 You can't list meals for this stall.", reply_markup=VENDOR_MENU
+            )
+            return ConversationHandler.END
 
-        await query.edit_message_text("✅ Stall selected.\n\n🍽️ Step 2/5: What's the meal title?")
+        context.user_data["stall_id"] = stall["id"]
+        await query.edit_message_text(
+            f"✅ Stall: {stall['stall_name']} ({stall['canteen_location']})\n\n"
+            "🍽️ Step 2/5: What's the meal title?"
+        )
         return MEAL_TITLE
 
     async def meal_title(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         """Step 2/5：记录餐品名称。"""
-        context.user_data["title"] = update.message.text.strip()
+        title = update.message.text.strip()
+        if len(title) > MAX_TITLE_LEN:
+            await update.message.reply_text(
+                f"❌ Title is too long (max {MAX_TITLE_LEN} characters). Please try again."
+            )
+            return MEAL_TITLE
+
+        context.user_data["title"] = title
         await update.message.reply_text(
             "💰 Step 3/5: Enter the original price and discount price, "
-            "separated by a comma.\ne.g. `6.50, 3.00`"
+            "separated by a comma.\ne.g. `6.50, 3.00`",
+            parse_mode=ParseMode.MARKDOWN,
         )
         return PRICES
 
@@ -163,12 +200,16 @@ class VendorBot:
                 raise ValueError
             original = float(parts[0].strip())
             discount = float(parts[1].strip())
-            if original <= 0 or discount < 0 or discount > original:
+            # float() 也接受 "nan" / "inf"，需显式排除
+            if not (math.isfinite(original) and math.isfinite(discount)):
+                raise ValueError
+            if original <= 0 or original > MAX_PRICE or discount < 0 or discount > original:
                 raise ValueError
         except ValueError:
             await update.message.reply_text(
                 "❌ Invalid format. Please enter like `6.50, 3.00` "
-                "(discount must not exceed original price)."
+                f"(discount must not exceed original price; max ${MAX_PRICE}).",
+                parse_mode=ParseMode.MARKDOWN,
             )
             return PRICES
 
@@ -181,21 +222,32 @@ class VendorBot:
         """Step 4/5：解析数量（正整数）。"""
         try:
             qty = int(update.message.text.strip())
-            if qty <= 0:
+            if not 0 < qty <= MAX_QUANTITY:
                 raise ValueError
         except ValueError:
-            await update.message.reply_text("❌ Please enter a positive whole number, e.g. `5`.")
+            await update.message.reply_text(
+                f"❌ Please enter a whole number from 1 to {MAX_QUANTITY}, e.g. `5`.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
             return QUANTITY
 
         context.user_data["quantity"] = qty
         await update.message.reply_text(
-            "🕖 Step 5/5: What's the pickup window?\ne.g. `7:30 PM - 8:30 PM`"
+            "🕖 Step 5/5: What's the pickup window?\ne.g. `7:30 PM - 8:30 PM`",
+            parse_mode=ParseMode.MARKDOWN,
         )
         return PICKUP_WINDOW
 
     async def pickup_window(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         """Step 5/5：保存 listing 到 Supabase 并通知 vendor。"""
         pickup = update.message.text.strip()
+        if len(pickup) > MAX_PICKUP_LEN:
+            await update.message.reply_text(
+                f"❌ Too long (max {MAX_PICKUP_LEN} characters). e.g. `7:30 PM - 8:30 PM`",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return PICKUP_WINDOW
+
         data = {
             "stall_id": context.user_data["stall_id"],
             "title": context.user_data["title"],
@@ -279,6 +331,8 @@ def main() -> None:
             CommandHandler("cancel", bot.cancel_add),
             CallbackQueryHandler(bot.cancel_add_cb, pattern="^cancel_meal$"),
         ],
+        # 流程中途再点「Add Surplus Meal」或发 /add 时重新开始，而不是卡在旧状态里没反应
+        allow_reentry=True,
     )
 
     application = Application.builder().token(
