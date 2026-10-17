@@ -23,7 +23,7 @@ from telegram.ext import (
     ContextTypes,
 )
 
-from common import get_bot_token, get_supabase
+from common import get_bot_token, get_supabase, schedule_db_keepalive
 
 logger = logging.getLogger(__name__)
 
@@ -338,6 +338,7 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(bot.my_reservations, pattern="^my_reservations$"))
     application.add_handler(CallbackQueryHandler(bot.reserve, pattern=r"^reserve:"))
     application.add_handler(CallbackQueryHandler(bot.back_to_menu, pattern="^back_menu$"))
+    schedule_db_keepalive(application, bot.supabase)
 
     logger.info("Student Bot 启动中...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)

@@ -4,7 +4,7 @@ A campus version of Too Good To Go for NTU: food stalls list surplus meals at a 
 
 ## Architecture
 
-- **Two Telegram bots** built with `python-telegram-bot` v20+ (async):
+- **Two Telegram bots** built with `python-telegram-bot` v22 (async):
   - `student_bot.py` — browse available meals (5 per page), reserve with one tap, view my reservations
   - `vendor_bot.py` — publish surplus meals via a five-step wizard (stall → title → prices → quantity → pickup window)
 - **Supabase (PostgreSQL)** — three tables: `stalls`, `listings`, `reservations` (`schema.sql`)
@@ -14,24 +14,27 @@ A campus version of Too Good To Go for NTU: food stalls list surplus meals at a 
 ## Project layout
 
 ```
-├── schema.sql       # database schema (run in Supabase SQL Editor)
-├── common.py        # shared: .env loading, Supabase client, admin whitelist
-├── student_bot.py   # student-facing bot
-├── vendor_bot.py    # vendor-facing bot
-└── PROPOSAL.md      # project proposal text
+├── schema.sql         # database schema (run in Supabase SQL Editor)
+├── common.py          # shared: .env loading, Supabase client, admin whitelist, DB keep-alive
+├── student_bot.py     # student-facing bot
+├── vendor_bot.py      # vendor-facing bot
+├── requirements.txt   # Python dependencies
+├── .env.example       # template for .env
+├── deploy/            # systemd service for running 24/7 on Linux
+└── PROPOSAL.md        # project proposal text
 ```
 
 ## Setup
 
 1. Create the two bots with **BotFather** (student bot + vendor bot) and note their tokens.
 2. Create a Supabase project and run `schema.sql` in the SQL Editor.
-3. Create a `.env` file (see template below).
+3. Create a `.env` file: `cp .env.example .env`, then fill it in (see template below).
 4. Install dependencies into a virtual environment (Python 3.10+):
 
    ```bash
    python3 -m venv .venv
    source .venv/bin/activate
-   pip install "python-telegram-bot>=20.0" "supabase>=2.0" python-dotenv
+   pip install -r requirements.txt
    ```
 
 5. Run the bots (two terminals, each with `source .venv/bin/activate` first):
@@ -43,7 +46,42 @@ A campus version of Too Good To Go for NTU: food stalls list surplus meals at a 
 
    Only one instance of each bot may run at a time — a second one fails with a Telegram `Conflict` error.
 
-> Free-tier Supabase projects are paused after a week of inactivity. If the bots log DNS errors such as `nodename nor servname provided`, restore the project from the Supabase dashboard; the bots reconnect on their own.
+> Free-tier Supabase projects are paused after a week of low database activity. While running, each bot queries the database every 6 hours to keep the project active (Supabase doesn't guarantee that automated traffic counts — only paid plans are exempt from pausing). If the bots log DNS errors such as `nodename nor servname provided`, restore the project from the Supabase dashboard; the bots reconnect on their own.
+
+## Run 24/7 on a Linux machine
+
+Both bots can run unattended as systemd user services that restart on crash and start at boot.
+
+1. Clone and install (on Debian/Ubuntu, `sudo apt install python3-venv` first):
+
+   ```bash
+   git clone https://github.com/zhangzexuanecho-droid/ntu-food-rescue-bot.git ~/ntu-food-rescue-bot
+   cd ~/ntu-food-rescue-bot
+   python3 -m venv .venv
+   .venv/bin/pip install -r requirements.txt
+   ```
+
+2. Put the `.env` file in `~/ntu-food-rescue-bot` (copy it from your other machine, or `cp .env.example .env` and fill it in).
+3. Install and start the services:
+
+   ```bash
+   mkdir -p ~/.config/systemd/user
+   cp deploy/ntu-food-rescue@.service ~/.config/systemd/user/
+   systemctl --user daemon-reload
+   systemctl --user enable --now ntu-food-rescue@student ntu-food-rescue@vendor
+   sudo loginctl enable-linger "$USER"   # keep running after logout and start at boot
+   ```
+
+4. Check status and logs:
+
+   ```bash
+   systemctl --user status ntu-food-rescue@student ntu-food-rescue@vendor
+   journalctl --user -u ntu-food-rescue@student -f
+   ```
+
+To deploy new code: `git pull`, rerun `.venv/bin/pip install -r requirements.txt` if it changed, then `systemctl --user restart ntu-food-rescue@student ntu-food-rescue@vendor`.
+
+On a laptop, keep it from sleeping: set `HandleLidSwitch=ignore` and `HandleLidSwitchExternalPower=ignore` in `/etc/systemd/logind.conf` (takes effect after a reboot) and turn off automatic suspend in the power settings.
 
 ### `.env` template
 

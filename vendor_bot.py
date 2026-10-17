@@ -26,7 +26,7 @@ from telegram.ext import (
 )
 from telegram.warnings import PTBUserWarning
 
-from common import get_admin_ids, get_bot_token, get_supabase
+from common import get_admin_ids, get_bot_token, get_supabase, schedule_db_keepalive
 
 logger = logging.getLogger(__name__)
 
@@ -340,6 +340,7 @@ def main() -> None:
     ).build()
     application.add_handler(CommandHandler("start", bot.start))
     application.add_handler(vendor_conv)
+    schedule_db_keepalive(application, bot.supabase)
 
     logger.info("Vendor Bot 启动中...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)

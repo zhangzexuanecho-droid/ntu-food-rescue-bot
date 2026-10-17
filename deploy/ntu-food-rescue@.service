@@ -1,0 +1,18 @@
+# systemd user service template, one instance per bot:
+#   ntu-food-rescue@student -> student_bot.py
+#   ntu-food-rescue@vendor  -> vendor_bot.py
+# Assumes the repo is cloned to ~/ntu-food-rescue-bot; edit both paths below if it isn't.
+# Setup: see "Run 24/7 on a Linux machine" in README.md.
+
+[Unit]
+Description=NTU Food Rescue %i bot
+
+[Service]
+WorkingDirectory=%h/ntu-food-rescue-bot
+ExecStart=%h/ntu-food-rescue-bot/.venv/bin/python %i_bot.py
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

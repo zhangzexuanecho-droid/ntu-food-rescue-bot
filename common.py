@@ -1,5 +1,5 @@
 """
-两个 Bot 共享的基础设施：.env 加载、Supabase 客户端工厂、日志配置。
+两个 Bot 共享的基础设施：.env 加载、Supabase 客户端工厂、日志配置、数据库保活。
 
 学生端运行：python student_bot.py
 商家端运行：python vendor_bot.py
@@ -7,9 +7,11 @@
 
 import logging
 import os
+from datetime import timedelta
 
 from dotenv import load_dotenv
 from supabase import Client, create_client
+from telegram.ext import Application, ContextTypes
 
 load_dotenv()
 
@@ -20,6 +22,14 @@ logging.basicConfig(
 # httpx 在 INFO 级别会打印每个请求的完整 URL，而 Bot API 的 URL 里含有 bot token；
 # 调到 WARNING，避免 token 出现在终端和日志文件里。
 logging.getLogger("httpx").setLevel(logging.WARNING)
+# JobQueue 底层的 APScheduler 每次执行定时任务都会打两行 INFO，同样调到 WARNING
+logging.getLogger("apscheduler").setLevel(logging.WARNING)
+
+logger = logging.getLogger(__name__)
+
+# Supabase 免费版一周内数据库活动太少就会自动暂停项目（官方说法：通常每天有几次请求就够）。
+# 每个 bot 每 6 小时查一次库，没人使用 bot 时数据库也保持活跃。
+KEEPALIVE_INTERVAL = timedelta(hours=6)
 
 
 def get_supabase() -> Client:
@@ -47,3 +57,20 @@ def get_admin_ids() -> set[int]:
     """
     raw = os.getenv("VENDOR_ADMIN_TELEGRAM_IDS", "")
     return {int(part) for part in raw.split(",") if part.strip()}
+
+
+def schedule_db_keepalive(application: Application, supabase: Client) -> None:
+    """注册定时保活任务：启动 1 分钟后开始，每隔 KEEPALIVE_INTERVAL 对数据库做一次轻量查询。"""
+    if application.job_queue is None:
+        raise RuntimeError("缺少 JobQueue 依赖，请运行 pip install -r requirements.txt")
+
+    async def ping(context: ContextTypes.DEFAULT_TYPE) -> None:
+        try:
+            supabase.table("stalls").select("id").limit(1).execute()
+            logger.info("Supabase 保活查询成功")
+        except Exception as exc:
+            logger.warning("Supabase 保活查询失败（项目可能已被暂停）: %s", exc)
+
+    application.job_queue.run_repeating(
+        ping, interval=KEEPALIVE_INTERVAL, first=60, name="db-keepalive"
+    )
