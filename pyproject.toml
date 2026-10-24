@@ -1,0 +1,9 @@
+[project]
+name = "cc06-proj"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "python-dotenv>=1.0",
+    "python-telegram-bot[job-queue]>=22,<23",
+    "supabase>=2.32,<3",
+]
