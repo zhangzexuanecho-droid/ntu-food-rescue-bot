@@ -41,23 +41,6 @@ wheels = [
 ]
 
 [[package]]
-name = "cc06-proj"
-version = "0.1.0"
-source = { virtual = "." }
-dependencies = [
-    { name = "python-dotenv" },
-    { name = "python-telegram-bot", extra = ["job-queue"] },
-    { name = "supabase" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "python-dotenv", specifier = ">=1.0" },
-    { name = "python-telegram-bot", extras = ["job-queue"], specifier = ">=22,<23" },
-    { name = "supabase", specifier = ">=2.32,<3" },
-]
-
-[[package]]
 name = "certifi"
 version = "2026.10.23"
 source = { registry = "https://pypi.org/simple" }
@@ -412,6 +395,23 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/5d/ba/364f7e48872400488221ab5d6e7f4f53c2538b4a71b574970e6fe1be5ad2/multidict-7.2.0-cp315-cp315t-win_amd64.whl", hash = "sha256:4e58a1abfe606d2371df52b17af2b5bb399bd380d3f9b1f586dc22c67499cc98", size = 100918, upload-time = "2026-10-24T09:17:21.416Z" },
     { url = "https://files.pythonhosted.org/packages/31/ab/3fbe88c5973042e78503fcacb9f0e7b67ec881667553c2cbf4607e6b9aa0/multidict-7.2.0-cp315-cp315t-win_arm64.whl", hash = "sha256:585c68f06a3c6fc451856832bac2bd2c9ef96c4e5ea30026dac262019c390398", size = 98555, upload-time = "2026-10-24T09:17:00.235Z" },
     { url = "https://files.pythonhosted.org/packages/37/de/b3863df13f743d63f117b94ed5c63f55bf30324ca42e1c2815dd08feffcc/multidict-7.2.0-py3-none-any.whl", hash = "sha256:0910835f36e7923be70c7e4b5fc2231d2d2515de60fbe55866f2e55e2832bbd7", size = 28058, upload-time = "2026-10-24T09:17:06.377Z" },
+]
+
+[[package]]
+name = "ntu-food-rescue-bot"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "python-dotenv" },
+    { name = "python-telegram-bot", extra = ["job-queue"] },
+    { name = "supabase" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "python-dotenv", specifier = ">=1.0" },
+    { name = "python-telegram-bot", extras = ["job-queue"], specifier = ">=22,<23" },
+    { name = "supabase", specifier = ">=2.32,<3" },
 ]
 
 [[package]]
