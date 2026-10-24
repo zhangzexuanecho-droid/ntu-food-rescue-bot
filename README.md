@@ -55,13 +55,13 @@ Both bots can run unattended as systemd user services that restart on crash and 
 1. Clone and install (on Debian/Ubuntu, `sudo apt install python3-venv` first):
 
    ```bash
-   git clone https://github.com/zhangzexuanecho-droid/ntu-food-rescue-bot.git ~/ntu-food-rescue-bot
-   cd ~/ntu-food-rescue-bot
+   git clone https://github.com/zhangzexuanecho-droid/ntu-food-rescue-bot.git ~/Dev/ntu-food-rescue-bot
+   cd ~/Dev/ntu-food-rescue-bot
    python3 -m venv .venv
    .venv/bin/pip install -r requirements.txt
    ```
 
-2. Put the `.env` file in `~/ntu-food-rescue-bot` (copy it from your other machine, or `cp .env.example .env` and fill it in).
+2. Put the `.env` file in `~/Dev/ntu-food-rescue-bot` (copy it from your other machine, or `cp .env.example .env` and fill it in).
 3. Install and start the services:
 
    ```bash
