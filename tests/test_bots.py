@@ -2,8 +2,8 @@
 
 No Telegram or Supabase connection needed. Put this file at tests/test_bots.py and run from the repo root:
 
-    uv run python tests/test_bots.py                      # SAME_DAY_ONLY off (demo mode): 5 + 6 eat-by scenarios
-    SAME_DAY_ONLY=true uv run python tests/test_bots.py   # SAME_DAY_ONLY on: 16 + 6 eat-by scenarios
+    uv run python tests/test_bots.py                      # SAME_DAY_ONLY off (demo mode): 5 + 6 eat-by + 6 my-listings scenarios
+    SAME_DAY_ONLY=true uv run python tests/test_bots.py   # SAME_DAY_ONLY on: 16 + 6 eat-by + 6 my-listings scenarios
 """
 
 import asyncio
@@ -77,6 +77,7 @@ class Query:
     def neq(self, c, v): return self._f(lambda r: r.get(c) != v)
     def gt(self, c, v): return self._f(lambda r: r.get(c) > v)
     def gte(self, c, v): return self._f(lambda r: r.get(c) >= v)
+    def in_(self, c, vals): return self._f(lambda r: r.get(c) in vals)
     def order(self, *a, **k): return self
 
     def limit(self, n):
@@ -321,17 +322,17 @@ async def eat_by_checks():
     sb, vb = student_bot.StudentBot(), vendor_bot.VendorBot()
     vb._notify_student = AsyncMock()
 
-    # fmt_eat_by: today -> time only, other day -> with date
+    # fmt_sg_time: today -> time only, other day -> with date
     now_sg = datetime.now(common.SG_TZ)
-    assert ":" in common.fmt_eat_by(now_sg) and "," not in common.fmt_eat_by(now_sg)
-    assert "," in common.fmt_eat_by(now_sg - timedelta(days=2))
-    print("✓ fmt_eat_by shows the date only when it isn't today")
+    assert ":" in common.fmt_sg_time(now_sg) and "," not in common.fmt_sg_time(now_sg)
+    assert "," in common.fmt_sg_time(now_sg - timedelta(days=2))
+    print("✓ fmt_sg_time shows the date only when it isn't today")
 
     # real listing: eat by = listing time + 3h
     u = cb_update("reserve:today1", 21)
     await sb.reserve(u, ctx())
     reply = u.callback_query.message.reply_text.call_args.args[0]
-    expected = common.fmt_eat_by(common.parse_ts(NOW) + common.EAT_WITHIN)
+    expected = common.fmt_sg_time(common.parse_ts(NOW) + common.EAT_WITHIN)
     assert f"Please eat by {expected}" in reply, reply
     code_real = reply.split("Claim Code: ")[1].split("\n")[0]
     print("✓ reservation shows eat-by =", expected)
@@ -346,8 +347,8 @@ async def eat_by_checks():
     reply = u.callback_query.message.reply_text.call_args.args[0]
     assert "Reservation confirmed" in reply, reply
     shown = reply.split("Please eat by ")[1].split(" (")[0]
-    assert shown in {common.fmt_eat_by(before + common.EAT_WITHIN),
-                     common.fmt_eat_by(before + common.EAT_WITHIN + timedelta(minutes=1))}, shown
+    assert shown in {common.fmt_sg_time(before + common.EAT_WITHIN),
+                     common.fmt_sg_time(before + common.EAT_WITHIN + timedelta(minutes=1))}, shown
     code_demo = reply.split("Claim Code: ")[1].split("\n")[0]
     print("✓ demo listing from yesterday reservable, eat-by = now + 3h:", shown)
 
@@ -378,9 +379,81 @@ async def eat_by_checks():
     print("\nALL PASSED (eat-by)")
 
 
+async def my_listings_checks():
+    """Vendor My Listings: own stall only, counts, summary, stop selling with confirmation. Both modes."""
+    db = seed()
+    db.tables["reservations"] += [
+        {"id": f"r_{st}", "listing_id": "today1", "student_telegram_id": 40 + i, "claim_code": f"CODE{i}0",
+         "status": st, "created_at": NOW}
+        for i, st in enumerate(("pending", "completed", "cancelled"))
+    ]
+    student_bot.get_supabase = lambda: db
+    vendor_bot.get_supabase = lambda: db
+    sb, vb = student_bot.StudentBot(), vendor_bot.VendorBot()
+    listings = {l["id"]: l for l in db.tables["listings"]}
+
+    # own stall via /listings: counts (cancelled ignored), summary line, other stall hidden
+    u = msg_update("/listings", 101)
+    await vb.my_listings(u, ctx())
+    text = u.message.reply_text.call_args.args[0]
+    assert "Chicken Rice Set" in text and "Hor Fun" not in text, text
+    assert "Listed 4 · 🟡 Reserved 1 · ✅ Collected 1 · Left 2" in text, text
+    if common.same_day_only():
+        assert "Today: 4 listed · 1 reserved · 1 collected" in text and "Stale Curry" not in text, text
+    else:
+        assert "All listings: 9 listed · 2 reserved · 1 collected" in text and "Stale Curry" in text, text
+    print("✓ My Listings: own stall only, counts and summary")
+
+    # admin sees all stalls; unlinked account is told to link
+    u = msg_update("/listings", 999)
+    await vb.my_listings(u, ctx())
+    assert "Hor Fun" in u.message.reply_text.call_args.args[0]
+    u = cb_update("mylist", 555)
+    await vb.my_listings(u, ctx())
+    assert "not linked" in u.callback_query.edit_message_text.call_args.args[0]
+    print("✓ admin sees all stalls, unlinked vendor locked out")
+
+    # another stall's vendor can't open the confirmation or stop it (forged callback data)
+    u = cb_update("stop:today1:0", 102)
+    await vb.confirm_stop(u, ctx())
+    assert "isn't available" in u.callback_query.edit_message_text.call_args.args[0]
+    assert u.callback_query.answer.await_count == 1
+    u = cb_update("stopyes:today1:0", 102)
+    await vb.do_stop(u, ctx())
+    assert listings["today1"]["quantity"] == 2
+    print("✓ other stall's vendor can't stop selling")
+
+    # own vendor: confirmation first, then stop -> quantity 0, students no longer see it
+    u = cb_update("stop:today1:0", 101)
+    await vb.confirm_stop(u, ctx())
+    assert "Stop selling Chicken Rice Set?" in u.callback_query.edit_message_text.call_args.args[0]
+    assert listings["today1"]["quantity"] == 2 and u.callback_query.answer.await_count == 1
+    u = cb_update("stopyes:today1:0", 101)
+    await vb.do_stop(u, ctx())
+    text = u.callback_query.edit_message_text.call_args.args[0]
+    rows = u.callback_query.edit_message_text.call_args.kwargs["reply_markup"].inline_keyboard
+    assert listings["today1"]["quantity"] == 0 and text.startswith("🛑 Stopped selling Chicken Rice Set")
+    assert "Left 0" in text and not any("Chicken Rice Set" in b.text for row in rows for b in row)
+    assert u.callback_query.answer.await_count == 1
+    u = cb_update("browse", 50)
+    await sb.browse(u, ctx())
+    assert "Chicken Rice Set" not in u.callback_query.edit_message_text.call_args.args[0]
+    print("✓ stop selling: confirm, quantity 0, hidden from students")
+
+    # the pending reservation can still be verified after stopping
+    u = msg_update("CODE00", 101)
+    vb._notify_student = AsyncMock()
+    await vb._handle_code(u, "CODE00")
+    assert "verified" in u.message.reply_text.call_args.args[0]
+    print("✓ existing reservation still collectable after stop")
+
+    print("\nALL PASSED (my listings)")
+
+
 async def run():
     await (main() if common.same_day_only() else demo_mode())
     await eat_by_checks()
+    await my_listings_checks()
 
 
 asyncio.run(run())

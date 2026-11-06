@@ -1,5 +1,5 @@
 """
-商家端 Bot（NTU Food Rescue）：五步发布剩余餐食；学生取餐时核销 claim code。
+商家端 Bot（NTU Food Rescue）：五步发布剩余餐食；学生取餐时核销 claim code；查看自己的 listing、提前下架。
 
 运行：
     python vendor_bot.py
@@ -15,6 +15,7 @@ from warnings import filterwarnings
 
 from telegram import Bot, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -28,12 +29,13 @@ from telegram.warnings import PTBUserWarning
 
 from common import (
     eat_by,
-    fmt_eat_by,
+    fmt_sg_time,
     get_admin_ids,
     get_bot_token,
     get_supabase,
     listed_today_or_demo,
     parse_ts,
+    same_day_only,
     schedule_db_keepalive,
 )
 
@@ -61,8 +63,12 @@ VENDOR_MENU = InlineKeyboardMarkup(
     [
         [InlineKeyboardButton("➕ Add Surplus Meal", callback_data="add_meal")],
         [InlineKeyboardButton("🎟️ Verify Claim Code", callback_data="verify")],
+        [InlineKeyboardButton("📋 My Listings", callback_data="mylist")],
     ]
 )
+
+# My Listings 每页的条数（和学生端浏览页一致）
+LISTINGS_PAGE_SIZE = 5
 
 
 class VendorBot:
@@ -395,7 +401,7 @@ class VendorBot:
 
         listing = reservation.get("listings") or {}
         stall = listing.get("stalls") or {}
-        deadline = fmt_eat_by(eat_by(
+        deadline = fmt_sg_time(eat_by(
             listing.get("created_at") or reservation["created_at"],
             parse_ts(reservation["created_at"]),
             stall,
@@ -468,6 +474,208 @@ class VendorBot:
             return "ok", reservation
         return "already_completed", reservation
 
+    # ------------------------------------------------------------------
+    # My Listings：查看自己摊位的 listing、提前下架
+    # ------------------------------------------------------------------
+
+    async def _show(self, update: Update, text: str, markup: InlineKeyboardMarkup) -> None:
+        """按钮触发时编辑原消息（内容没变时忽略 not modified 报错），命令触发时发新消息。"""
+        query = update.callback_query
+        if query is None:
+            await update.message.reply_text(text, reply_markup=markup)
+            return
+        try:
+            await query.edit_message_text(text, reply_markup=markup)
+        except BadRequest as exc:
+            if "not modified" not in str(exc).lower():
+                raise
+
+    def _load_listings(self, vendor_id: int, is_admin: bool) -> list[dict] | None:
+        """取本摊位（管理员：全部摊位）可见的 listing，附上预订统计；未绑定摊位返回 None。
+
+        「可见」与学生端一致：SAME_DAY_ONLY 打开时只看今天发布的（demo 摊位除外），卖完的也列出来。
+        """
+        q = self.supabase.table("listings").select(
+            "id, title, quantity, pickup_time, created_at, stall_id, "
+            "stalls(stall_name, vendor_telegram_id)"
+        )
+        if not is_admin:
+            stall_ids = [
+                s["id"] for s in self.supabase.table("stalls").select("id")
+                .eq("vendor_telegram_id", vendor_id).execute().data or []
+            ]
+            if not stall_ids:
+                return None
+            q = q.in_("stall_id", stall_ids)
+        listings = [
+            item for item in q.order("created_at", desc=True).execute().data or []
+            if listed_today_or_demo(item["created_at"], item.get("stalls"))
+        ]
+        if not listings:
+            return []
+
+        # 统计每个 listing 的预订：pending = 已订未领，completed = 已领走；cancelled 不算
+        reservations = (
+            self.supabase.table("reservations")
+            .select("listing_id, status")
+            .in_("listing_id", [item["id"] for item in listings])
+            .execute()
+            .data or []
+        )
+        for item in listings:
+            statuses = [r["status"] for r in reservations if r["listing_id"] == item["id"]]
+            item["reserved"] = statuses.count("pending")
+            item["collected"] = statuses.count("completed")
+            # 没有存最初挂了几份：剩余 + 已订（含已领）反推出来
+            item["listed"] = item["quantity"] + item["reserved"] + item["collected"]
+        return listings
+
+    async def my_listings(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, notice: str = "", answer: bool = True
+    ) -> None:
+        """My Listings 列表：顶部汇总 + 每条 listing 的挂出/已订/已领/剩余，分页显示。
+
+        入口：按钮（callback "mylist" 或 "mylist:<页码>"）或 /listings。
+        """
+        query = update.callback_query
+        page = 0
+        if query is not None:
+            if answer:  # 一个 callback 只能 answer 一次，调用方已经 answer 过时传 False
+                await query.answer()
+            _, _, arg = query.data.partition(":")
+            page = int(arg.split(":")[-1]) if arg.split(":")[-1].isdigit() else 0
+        vendor_id = update.effective_user.id
+
+        try:
+            listings = self._load_listings(vendor_id, vendor_id in get_admin_ids())
+        except Exception as exc:
+            logger.error("查询 My Listings 失败 vendor_id=%s: %s", vendor_id, exc)
+            await self._show(update, "⚠️ Something went wrong. Please try again.", VENDOR_MENU)
+            return
+        if listings is None:
+            await self._show(
+                update,
+                "🔒 You are not linked to any stall yet.\n\n"
+                f"Your vendor ID is {vendor_id} — send it to the admin "
+                "so they can link your stall to your account.",
+                VENDOR_MENU,
+            )
+            return
+        if not listings:
+            await self._show(update, notice + "📭 You have no listings to show yet.", VENDOR_MENU)
+            return
+
+        pages = (len(listings) + LISTINGS_PAGE_SIZE - 1) // LISTINGS_PAGE_SIZE
+        page = min(page, pages - 1)
+        start = page * LISTINGS_PAGE_SIZE
+        page_items = listings[start : start + LISTINGS_PAGE_SIZE]
+
+        scope = "Today" if same_day_only() else "All listings"
+        lines = [
+            f"{notice}📋 My Listings (page {page + 1}/{pages})\n",
+            f"{scope}: {sum(i['listed'] for i in listings)} listed · "
+            f"{sum(i['reserved'] for i in listings)} reserved · "
+            f"{sum(i['collected'] for i in listings)} collected\n",
+        ]
+        keyboard = []
+        for n, item in enumerate(page_items, start + 1):
+            stall = item.get("stalls") or {}
+            lines.append(
+                f"{n}. {item['title']}\n"
+                f"   🏪 {stall.get('stall_name', 'N/A')} · listed {fmt_sg_time(parse_ts(item['created_at']))}\n"
+                f"   🕖 {item.get('pickup_time') or 'TBA'}\n"
+                f"   📦 Listed {item['listed']} · 🟡 Reserved {item['reserved']} · "
+                f"✅ Collected {item['collected']} · Left {item['quantity']}\n"
+            )
+            if item["quantity"] > 0:
+                keyboard.append([InlineKeyboardButton(
+                    f"🛑 Stop selling #{n}: {item['title'][:30]}",
+                    callback_data=f"stop:{item['id']}:{page}",
+                )])
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("◀️ Prev", callback_data=f"mylist:{page - 1}"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton("Next ▶️", callback_data=f"mylist:{page + 1}"))
+        if nav:
+            keyboard.append(nav)
+        keyboard.append([InlineKeyboardButton("🔙 Back to Menu", callback_data="vmenu")])
+        await self._show(update, "\n".join(lines), InlineKeyboardMarkup(keyboard))
+
+    def _own_listing(self, listing_id: str, vendor_id: int) -> dict | None:
+        """取 listing 并校验归属：管理员可管理全部，普通商家只能管理自己摊位的。
+
+        callback_data 可以被伪造，所以下架前（确认页和真正执行时）都要在服务端再查一次。
+        """
+        res = (
+            self.supabase.table("listings")
+            .select("id, title, quantity, stalls(stall_name, vendor_telegram_id)")
+            .eq("id", listing_id)
+            .execute()
+        )
+        if not res.data:
+            return None
+        listing = res.data[0]
+        stall = listing.get("stalls") or {}
+        if vendor_id not in get_admin_ids() and stall.get("vendor_telegram_id") != vendor_id:
+            return None
+        return listing
+
+    async def confirm_stop(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """「Stop selling」第一步：二次确认（callback "stop:<listing_id>:<页码>"）。"""
+        query = update.callback_query
+        await query.answer()
+        _, listing_id, page = (query.data.split(":") + ["0"])[:3]
+        try:
+            listing = self._own_listing(listing_id, update.effective_user.id)
+        except Exception as exc:
+            logger.error("查询 listing 失败 id=%s: %s", listing_id, exc)
+            await self._show(update, "⚠️ Something went wrong. Please try again.", VENDOR_MENU)
+            return
+        if listing is None:
+            await self.my_listings(
+                update, context, notice="⚠️ That listing isn't available to you.\n\n", answer=False
+            )
+            return
+
+        await self._show(
+            update,
+            f"🛑 Stop selling {listing['title']}?\n\n"
+            f"The {listing['quantity']} portion(s) left will be hidden from students right away. "
+            "Students who already reserved can still collect with their claim code.",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Yes, stop selling", callback_data=f"stopyes:{listing_id}:{page}")],
+                [InlineKeyboardButton("↩️ No, go back", callback_data=f"mylist:{page}")],
+            ]),
+        )
+
+    async def do_stop(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """「Stop selling」第二步：把剩余份数设为 0（callback "stopyes:<listing_id>:<页码>"）。
+
+        已有的预订不受影响；学生端扣库存用的是 CAS，这里改成 0 之后正在进行的预订会看到售罄。
+        """
+        query = update.callback_query
+        listing_id = query.data.split(":")[1]
+        try:
+            listing = self._own_listing(listing_id, update.effective_user.id)
+            if listing is not None:
+                self.supabase.table("listings").update({"quantity": 0}).eq("id", listing_id).execute()
+        except Exception as exc:
+            logger.error("下架失败 id=%s: %s", listing_id, exc)
+            await query.answer("⚠️ Something went wrong. Please try again.", show_alert=True)
+            return
+        notice = (
+            f"🛑 Stopped selling {listing['title']}.\n\n" if listing is not None
+            else "⚠️ That listing isn't available to you.\n\n"
+        )
+        # my_listings 会 answer 这个 callback，并按 callback_data 末尾的页码回到原来那一页
+        await self.my_listings(update, context, notice=notice)
+
+    async def back_to_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """My Listings 的「Back to Menu」按钮。"""
+        await update.callback_query.answer()
+        await self._show(update, "What would you like to do?", VENDOR_MENU)
+
     async def cancel_add(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         """/cancel 命令退出当前流程（发布或核销）。"""
         context.user_data.clear()
@@ -525,6 +733,12 @@ def main() -> None:
     ).build()
     application.add_handler(CommandHandler("start", bot.start))
     application.add_handler(vendor_conv)
+    # My Listings 不是多步对话，放在 ConversationHandler 外面；对话进行中点这些按钮也能用
+    application.add_handler(CommandHandler("listings", bot.my_listings))
+    application.add_handler(CallbackQueryHandler(bot.my_listings, pattern=r"^mylist(:\d+)?$"))
+    application.add_handler(CallbackQueryHandler(bot.confirm_stop, pattern=r"^stop:"))
+    application.add_handler(CallbackQueryHandler(bot.do_stop, pattern=r"^stopyes:"))
+    application.add_handler(CallbackQueryHandler(bot.back_to_menu, pattern="^vmenu$"))
     schedule_db_keepalive(application, bot.supabase)
 
     logger.info("Vendor Bot 启动中...")
