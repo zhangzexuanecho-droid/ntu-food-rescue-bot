@@ -12,6 +12,7 @@
 import logging
 import secrets
 import string
+from datetime import datetime, timezone
 
 from postgrest import APIError
 from telegram import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -24,10 +25,13 @@ from telegram.ext import (
 )
 
 from common import (
+    eat_by,
+    fmt_eat_by,
     get_admin_ids,
     get_bot_token,
     get_supabase,
-    only_today,
+    listed_today_or_demo,
+    parse_ts,
     schedule_db_keepalive,
     today_start_utc,
 )
@@ -105,6 +109,7 @@ class StudentBot:
         """查询 quantity > 0 的 listings（join stalls），分页展示并附 Reserve 按钮。
 
         SAME_DAY_ONLY 打开时只显示今天发布的：之前日子没卖完的不再显示，只卖当天做的食物。
+        demo 摊位（没绑定商家）的餐品不受这个限制，随时都能演示，所以这里在 Python 里筛选。
 
         callback_data 为 "browse"（第一页）或 "browse:<页码>"（翻页，页码从 0 开始）。
         """
@@ -114,16 +119,20 @@ class StudentBot:
         page = int(page_arg) if page_arg.isdigit() else 0
 
         try:
-            available = (
+            res = (
                 self.supabase.table("listings")
                 .select(
-                    "id, title, original_price, discount_price, quantity, "
-                    "pickup_time, stalls(stall_name, canteen_location)"
+                    "id, title, original_price, discount_price, quantity, pickup_time, created_at, "
+                    "stalls(stall_name, canteen_location, vendor_telegram_id)"
                 )
                 .gt("quantity", 0)
+                .order("created_at", desc=True)
+                .execute()
             )
-            res = only_today(available).order("created_at", desc=True).execute()
-            items = res.data or []
+            items = [
+                item for item in res.data or []
+                if listed_today_or_demo(item["created_at"], item.get("stalls"))
+            ]
         except Exception as exc:
             logger.error("查询 listings 失败: %s", exc)
             await self._render_menu(query, "⚠️ Something went wrong. Please try again.")
@@ -176,7 +185,7 @@ class StudentBot:
     async def reserve(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """
         处理 Reserve Now：
-          1. 取最新详情（列表页数据可能已过期；SAME_DAY_ONLY 打开时只接受今天发布的 listing）
+          1. 取最新详情（列表页数据可能已过期；SAME_DAY_ONLY 打开时只接受今天发布的或 demo 摊位的 listing）
           2. 每个学生每天限订一份（管理员不受限，方便测试和演示）
           3. CAS 扣减一份库存，售罄则弹窗提示
           4. 写入 reservations（含 6 位随机 claim_code），写入失败则回补库存
@@ -193,12 +202,18 @@ class StudentBot:
         user = query.from_user
 
         try:
-            res = only_today(
+            res = (
                 self.supabase.table("listings")
-                .select("id, title, quantity, pickup_time, stalls(stall_name, canteen_location)")
+                .select(
+                    "id, title, quantity, pickup_time, created_at, "
+                    "stalls(stall_name, canteen_location, vendor_telegram_id)"
+                )
                 .eq("id", listing_id)
-            ).execute()
-            if not res.data:
+                .execute()
+            )
+            if not res.data or not listed_today_or_demo(
+                res.data[0]["created_at"], res.data[0].get("stalls")
+            ):
                 await query.answer("😔 This listing is no longer available.", show_alert=True)
                 return
             listing = res.data[0]
@@ -228,11 +243,13 @@ class StudentBot:
 
         await query.answer()
         stall = listing.get("stalls") or {}
+        deadline = eat_by(listing["created_at"], datetime.now(timezone.utc), stall)
         await query.message.reply_text(
             "🎉 Reservation confirmed!\n\n"
             f"🍽️ {listing['title']}\n"
             f"📍 {stall.get('stall_name', 'N/A')} — {stall.get('canteen_location', 'N/A')}\n"
-            f"🕖 Pickup: {listing.get('pickup_time') or 'TBA'}\n\n"
+            f"🕖 Pickup: {listing.get('pickup_time') or 'TBA'}\n"
+            f"⏰ Please eat by {fmt_eat_by(deadline)} (food safety)\n\n"
             f"🎟️ Your Claim Code: {claim_code}\n\n"
             "Show this code at the stall to collect your meal. Enjoy!"
         )
@@ -311,24 +328,29 @@ class StudentBot:
     async def my_reservations(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """查询当前用户 status = 'pending' 的预订（join listings → stalls）。
 
-        已核销（completed）的不显示；SAME_DAY_ONLY 打开时，之前日子没领的预订已过期，也不显示。
+        已核销（completed）的不显示；SAME_DAY_ONLY 打开时，之前日子没领的预订已过期，也不显示
+        （demo 摊位的预订除外）。
         """
         query = update.callback_query
         await query.answer()
         user = query.from_user
 
         try:
-            pending = (
+            res = (
                 self.supabase.table("reservations")
                 .select(
-                    "claim_code, status, created_at, "
-                    "listings(title, pickup_time, stalls(stall_name, canteen_location))"
+                    "claim_code, status, created_at, listings(title, pickup_time, created_at, "
+                    "stalls(stall_name, canteen_location, vendor_telegram_id))"
                 )
                 .eq("student_telegram_id", user.id)
                 .eq("status", "pending")
+                .order("created_at", desc=True)
+                .execute()
             )
-            res = only_today(pending).order("created_at", desc=True).execute()
-            rows = res.data or []
+            rows = [
+                r for r in res.data or []
+                if listed_today_or_demo(r["created_at"], (r.get("listings") or {}).get("stalls"))
+            ]
         except Exception as exc:
             logger.error("查询预订失败 telegram_id=%s: %s", user.id, exc)
             await self._render_menu(query, "⚠️ Something went wrong. Please try again.")
@@ -342,10 +364,12 @@ class StudentBot:
         for i, r in enumerate(rows, 1):
             listing = r.get("listings") or {}
             stall = listing.get("stalls") or {}
+            deadline = eat_by(listing.get("created_at") or r["created_at"], parse_ts(r["created_at"]), stall)
             lines.append(
                 f"{i}. {listing.get('title', 'N/A')}\n"
                 f"   🎟️ {r['claim_code']} | 📍 {stall.get('canteen_location', 'N/A')}\n"
                 f"   🕖 {listing.get('pickup_time') or 'TBA'} | Status: {r['status']}\n"
+                f"   ⏰ Eat by {fmt_eat_by(deadline)}\n"
             )
 
         await query.edit_message_text(

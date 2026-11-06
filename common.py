@@ -36,17 +36,53 @@ KEEPALIVE_INTERVAL = timedelta(hours=6)
 SG_TZ = ZoneInfo("Asia/Singapore")
 
 
+# 食品安全提醒：SFA 要求熟食在煮好后 4 小时内吃完。bot 不知道真正的煮好时间，按「发布时刚煮好」估算，
+# 再留 1 小时余量，所以提醒学生在发布后 3 小时内吃完。
+EAT_WITHIN = timedelta(hours=3)
+
+
+def is_demo_stall(stall: dict | None) -> bool:
+    """没有绑定商家（vendor_telegram_id 为空）的摊位算 demo，它的餐品不受日期限制。"""
+    return bool(stall) and stall.get("vendor_telegram_id") is None
+
+
+def parse_ts(value: str) -> datetime:
+    """解析数据库返回的 timestamptz 字符串（兼容结尾的 'Z'）。"""
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def listed_today_or_demo(created_at: str, stall: dict | None) -> bool:
+    """SAME_DAY_ONLY 打开时，只有今天发布的或 demo 摊位的才可用；开关关闭时一律可用。"""
+    if not same_day_only() or is_demo_stall(stall):
+        return True
+    return parse_ts(created_at) >= parse_ts(today_start_utc())
+
+
+def eat_by(listing_created_at: str, reserved_at: datetime, stall: dict | None) -> datetime:
+    """学生应在什么时间之前吃完。
+
+    真实餐品：发布时间 + EAT_WITHIN。demo 餐品的发布时间可能是很多天前，改用预订时间 + EAT_WITHIN，
+    这样每次演示看到的都是一个合理的时间。
+    """
+    start = reserved_at if is_demo_stall(stall) else parse_ts(listing_created_at)
+    return start + EAT_WITHIN
+
+
+def fmt_eat_by(dt: datetime) -> str:
+    """按新加坡时间显示，例如 '11:00 PM'；不是今天的再加上日期，例如 'Nov 5, 11:00 PM'。"""
+    local = dt.astimezone(SG_TZ)
+    clock = local.strftime("%I:%M %p").lstrip("0")
+    if local.date() == datetime.now(SG_TZ).date():
+        return clock
+    return f"{local.strftime('%b')} {local.day}, {clock}"
+
+
 def same_day_only() -> bool:
     """SAME_DAY_ONLY=true 时，只有当天发布的餐品可以浏览、预订、核销（食品安全：只卖当天做的食物）。
 
     默认关闭：demo 阶段要能看到示例数据和之前发布的 listing；正式 pilot 时在 .env 里打开。
     """
     return os.getenv("SAME_DAY_ONLY", "").strip().lower() in {"1", "true", "yes", "on"}
-
-
-def only_today(query):
-    """SAME_DAY_ONLY 打开时给查询加上 created_at >= 今天 00:00（新加坡时间），否则原样返回。"""
-    return query.gte("created_at", today_start_utc()) if same_day_only() else query
 
 
 def today_start_utc() -> str:

@@ -11,7 +11,8 @@ A campus version of Too Good To Go for NTU: food stalls list surplus meals at a 
 - **Supabase (PostgreSQL)** — three tables: `stalls`, `listings`, `reservations` (`schema.sql`)
 - **Role-based access** — each vendor account is linked to its own stall via `vendor_telegram_id`; admin Telegram IDs (configured in `.env`) can manage all stalls
 - Reservations decrement stock with a compare-and-swap update (`WHERE quantity = <value just read>`, retried on conflict), so concurrent reservations can't oversell; if saving the reservation fails, the portion is put back. Unique 6-character claim codes for collection
-- **Same-day only (optional)** — with `SAME_DAY_ONLY=true` in `.env`, only listings published today (Singapore time) can be browsed or reserved, and only today's reservations can be collected; earlier ones expire. Off by default so demo data stays visible; turn it on for a real pilot
+- **Same-day only (optional)** — with `SAME_DAY_ONLY=true` in `.env`, only listings published today (Singapore time) can be browsed or reserved, and only today's reservations can be collected; earlier ones expire. Off by default so demo data stays visible; turn it on for a real pilot. Stalls not linked to a vendor (`vendor_telegram_id` empty) count as demo stalls and are always exempt
+- **Eat-by reminder** — the reservation confirmation, My Reservations and the vendor's verify reply show when the meal should be eaten: listing time + 3 hours (food is assumed freshly cooked when listed; 1 hour of margin under SFA's 4-hour rule). For demo stalls it is reservation time + 3 hours. After a vendor verifies a code, the student bot also messages the student this reminder
 - **Daily limit** — each student can reserve 1 meal per day (pending or collected); admin Telegram IDs are exempt so the bots can be tested and demoed
 
 ## Project layout
