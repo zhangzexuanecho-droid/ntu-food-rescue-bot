@@ -13,7 +13,7 @@ import logging
 import math
 from warnings import filterwarnings
 
-from telegram import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import Bot, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -27,10 +27,13 @@ from telegram.ext import (
 from telegram.warnings import PTBUserWarning
 
 from common import (
+    eat_by,
+    fmt_eat_by,
     get_admin_ids,
     get_bot_token,
     get_supabase,
-    only_today,
+    listed_today_or_demo,
+    parse_ts,
     schedule_db_keepalive,
 )
 
@@ -67,6 +70,19 @@ class VendorBot:
 
     def __init__(self) -> None:
         self.supabase = get_supabase()
+        # 核销后通知学生要用学生端 bot 发：商家端 bot 不能主动给没和它聊过天的学生发消息
+        self._student_bot: Bot | None = None
+
+    async def _notify_student(self, telegram_id: int, text: str) -> None:
+        """用学生端 bot 给学生发一条消息；失败（比如学生屏蔽了 bot）只记日志，不影响核销结果。"""
+        try:
+            if self._student_bot is None:
+                bot = Bot(get_bot_token("TELEGRAM_STUDENT_BOT_TOKEN"))
+                await bot.initialize()
+                self._student_bot = bot
+            await self._student_bot.send_message(telegram_id, text)
+        except Exception as exc:
+            logger.warning("通知学生失败 telegram_id=%s: %s", telegram_id, exc)
 
     # ------------------------------------------------------------------
     # /start 与通用辅助
@@ -379,11 +395,17 @@ class VendorBot:
 
         listing = reservation.get("listings") or {}
         stall = listing.get("stalls") or {}
+        deadline = fmt_eat_by(eat_by(
+            listing.get("created_at") or reservation["created_at"],
+            parse_ts(reservation["created_at"]),
+            stall,
+        ))
         replies = {
             "ok": (
                 f"✅ Code {code} verified!\n\n"
                 f"Please hand over: 🍽️ {listing.get('title', 'N/A')}\n"
                 f"🏪 {stall.get('stall_name', 'N/A')}\n\n"
+                f"⏰ Remind the student to eat it by {deadline}.\n"
                 "Marked as collected."
             ),
             "already_completed": (
@@ -396,6 +418,12 @@ class VendorBot:
             ),
         }
         await message.reply_text(replies[result], reply_markup=VENDOR_MENU)
+        if result == "ok":
+            await self._notify_student(
+                reservation["student_telegram_id"],
+                f"✅ Meal collected: {listing.get('title', 'N/A')} from {stall.get('stall_name', 'N/A')}\n\n"
+                f"⏰ Please eat it by {deadline} for food safety. Enjoy! 🌏",
+            )
         return ConversationHandler.END
 
     def _verify_claim(self, code: str, vendor_id: int, is_admin: bool) -> tuple[str, dict | None]:
@@ -406,7 +434,10 @@ class VendorBot:
         """
         res = (
             self.supabase.table("reservations")
-            .select("id, status, listings(title, stalls(stall_name, vendor_telegram_id))")
+            .select(
+                "id, status, created_at, student_telegram_id, "
+                "listings(title, created_at, stalls(stall_name, vendor_telegram_id))"
+            )
             .eq("claim_code", code)
             .execute()
         )
@@ -421,19 +452,21 @@ class VendorBot:
         if reservation["status"] != "pending":
             return "cancelled", reservation
 
-        # 条件更新：WHERE 带上 status = 'pending'，同一个码被重复提交时只有第一次生效，不会被领两次；
-        # SAME_DAY_ONLY 打开时再加上「今天的预订」
-        updated = only_today(
+        # SAME_DAY_ONLY 打开时，之前日子的预订已过期（demo 摊位的除外）
+        if not listed_today_or_demo(reservation["created_at"], stall):
+            return "expired", reservation
+
+        # 条件更新：WHERE 带上 status = 'pending'，同一个码被重复提交时只有第一次生效，不会被领两次
+        updated = (
             self.supabase.table("reservations")
             .update({"status": "completed"})
             .eq("id", reservation["id"])
             .eq("status", "pending")
-        ).execute()
+            .execute()
+        )
         if updated.data:
             return "ok", reservation
-        # PTB 逐个处理 update，期间唯一可能改动 status 的是本 bot 自己，
-        # 所以没更新到只可能是 SAME_DAY_ONLY 打开且预订不是今天的，即已过期
-        return "expired", reservation
+        return "already_completed", reservation
 
     async def cancel_add(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         """/cancel 命令退出当前流程（发布或核销）。"""
