@@ -6,7 +6,9 @@ A campus version of Too Good To Go for NTU: food stalls list surplus meals at a 
 
 - **Two Telegram bots** built with `python-telegram-bot` v22 (async):
   - `student_bot.py` — browse available meals (5 per page), reserve with one tap (1 meal per student per day), view my reservations
-  - `vendor_bot.py` — publish surplus meals via a five-step wizard (stall → title → prices → quantity → pickup window)
+  - `vendor_bot.py` — publish surplus meals via a five-step wizard (stall → title → prices → quantity → pickup window);
+    every step offers tappable options and still accepts typing: meals the stall listed before (one tap reuses name and
+    prices), discount buttons (30–60% off, rounded to 10 cents), quantity 1/2/3/5/10, and pickup windows starting now
     and verify a student's claim code at pickup (button or `/verify CODE`), which marks the reservation as completed
     and see **My Listings** (button or `/listings`): per listing how many were listed / reserved / collected / left, a summary line on top, and a 🛑 Stop selling button (with confirmation) that hides the rest from students
 - **Supabase (PostgreSQL)** — three tables: `stalls`, `listings`, `reservations` (`schema.sql`)

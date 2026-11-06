@@ -11,6 +11,8 @@
 
 import logging
 import math
+from datetime import datetime, timedelta
+from decimal import ROUND_HALF_UP, Decimal
 from warnings import filterwarnings
 
 from telegram import Bot, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -28,6 +30,8 @@ from telegram.ext import (
 from telegram.warnings import PTBUserWarning
 
 from common import (
+    EAT_WITHIN,
+    SG_TZ,
     eat_by,
     fmt_sg_time,
     get_admin_ids,
@@ -69,6 +73,12 @@ VENDOR_MENU = InlineKeyboardMarkup(
 
 # My Listings 每页的条数（和学生端浏览页一致）
 LISTINGS_PAGE_SIZE = 5
+
+# 发布流程里可点的选项（都保留手动输入）
+MAX_RECENT_MEALS = 6                    # Step 2：最多显示几个以前发布过的菜
+DISCOUNT_OPTIONS = (30, 40, 50, 60)     # Step 3：折扣百分比
+QUANTITY_OPTIONS = (1, 2, 3, 5, 10)     # Step 4：份数
+PICKUP_WINDOW_MINUTES = (30, 60, 120)   # Step 5：从现在开始的取餐窗口长度
 
 
 class VendorBot:
@@ -160,14 +170,7 @@ class VendorBot:
 
         # 普通 vendor 名下只有一个摊位：自动选中，直接进入 Step 2
         if not is_admin and len(stalls) == 1:
-            stall = stalls[0]
-            context.user_data["stall_id"] = stall["id"]
-            await self._reply_step(
-                update,
-                f"✅ Stall: {stall['stall_name']} ({stall['canteen_location']})\n\n"
-                "🍽️ Step 2/5: What's the meal title?",
-            )
-            return MEAL_TITLE
+            return await self._ask_title(update, context, stalls[0])
 
         # 名下多个摊位：列出供选择，并记下可选范围供 select_stall 校验
         # （callback_data 可被恶意客户端伪造，不能直接信任按钮里的 stall id）
@@ -191,7 +194,7 @@ class VendorBot:
         return SELECT_STALL
 
     async def select_stall(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """校验并记录所选摊位，询问餐品名称。"""
+        """校验所选摊位，进入 Step 2。"""
         query = update.callback_query
         await query.answer()
         stall = context.user_data.get("stalls", {}).get(query.data.split(":", 1)[1])
@@ -201,16 +204,86 @@ class VendorBot:
                 "🔒 You can't list meals for this stall.", reply_markup=VENDOR_MENU
             )
             return ConversationHandler.END
+        return await self._ask_title(update, context, stall)
 
+    # 每一步都提供可点的选项，同时保留手动输入。按钮里的 callback_data 只放序号或固定选项，
+    # 服务端只接受本次流程里生成过的选项（存在 user_data 里），伪造或过期的按钮一律忽略。
+
+    def _recent_meals(self, stall_id: str) -> list[dict]:
+        """这个摊位最近发布过的菜（按菜名去重，最多 MAX_RECENT_MEALS 个），用作「模板」。
+
+        查询失败只记日志、返回空列表，不影响正常发布。0 元的条目（demo 提示、测试数据）跳过。
+        """
+        try:
+            rows = (
+                self.supabase.table("listings")
+                .select("title, original_price, discount_price")
+                .eq("stall_id", stall_id)
+                .order("created_at", desc=True)
+                .limit(30)
+                .execute()
+                .data or []
+            )
+        except Exception as exc:
+            logger.warning("查询历史餐品失败 stall_id=%s: %s", stall_id, exc)
+            return []
+        seen, meals = set(), []
+        for r in rows:
+            key = r["title"].strip().lower()
+            if key in seen or float(r["original_price"]) <= 0:
+                continue
+            seen.add(key)
+            meals.append({
+                "title": r["title"],
+                "original_price": float(r["original_price"]),
+                "discount_price": float(r["discount_price"]),
+            })
+            if len(meals) == MAX_RECENT_MEALS:
+                break
+        return meals
+
+    async def _ask_title(self, update: Update, context: ContextTypes.DEFAULT_TYPE, stall: dict) -> int:
+        """Step 2/5：问餐品名称；以前发布过的菜做成按钮，点一下带出菜名和价格。"""
         context.user_data["stall_id"] = stall["id"]
-        await query.edit_message_text(
+        recent = self._recent_meals(stall["id"])
+        context.user_data["recent"] = recent
+        keyboard = [
+            [InlineKeyboardButton(
+                f"📌 {m['title'][:30]} · ${m['original_price']:.2f} → ${m['discount_price']:.2f}",
+                callback_data=f"recent:{i}",
+            )]
+            for i, m in enumerate(recent)
+        ]
+        hint = (
+            "Tap a meal you listed before to reuse its name and prices, or type a new title."
+            if recent else "Type the meal title."
+        )
+        await self._reply_step(
+            update,
             f"✅ Stall: {stall['stall_name']} ({stall['canteen_location']})\n\n"
-            "🍽️ Step 2/5: What's the meal title?"
+            f"🍽️ Step 2/5: What's the meal title?\n{hint}",
+            InlineKeyboardMarkup(keyboard) if keyboard else None,
         )
         return MEAL_TITLE
 
+    async def pick_recent(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Step 2/5 点了历史餐品：带出菜名和价格，跳过 Step 3。"""
+        query = update.callback_query
+        await query.answer()
+        recent = context.user_data.get("recent", [])
+        idx = int(query.data.split(":")[1])
+        if not 0 <= idx < len(recent):
+            await query.edit_message_text("🍽️ Step 2/5: Please type the meal title.")
+            return MEAL_TITLE
+        meal = recent[idx]
+        context.user_data.update(meal)
+        return await self._ask_quantity(
+            update,
+            f"✅ {meal['title']} · ${meal['original_price']:.2f} → ${meal['discount_price']:.2f}\n\n",
+        )
+
     async def meal_title(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """Step 2/5：记录餐品名称。"""
+        """Step 2/5：手动输入餐品名称。"""
         title = update.message.text.strip()
         if len(title) > MAX_TITLE_LEN:
             await update.message.reply_text(
@@ -220,40 +293,103 @@ class VendorBot:
 
         context.user_data["title"] = title
         await update.message.reply_text(
-            "💰 Step 3/5: Enter the original price and discount price, "
-            "separated by a comma.\ne.g. `6.50, 3.00`",
+            "💰 Step 3/5: What's the original price? e.g. `6.50`\n"
+            "You'll pick the discount next — or type both prices now, e.g. `6.50, 3.00`.",
             parse_mode=ParseMode.MARKDOWN,
         )
         return PRICES
 
+    @staticmethod
+    def _parse_price(text: str) -> float:
+        """解析一个价格；float() 也接受 "nan" / "inf"，需显式排除。非法时抛 ValueError。"""
+        value = float(text.replace("$", "").strip())
+        if not math.isfinite(value):
+            raise ValueError
+        return value
+
+    @staticmethod
+    def _discounted(original: float, pct: int) -> float:
+        """原价打 pct% off 后的价格，四舍五入到 0.10（食堂价格一般是一角为单位）。"""
+        price = Decimal(str(original)) * (100 - pct) / 100
+        return float(price.quantize(Decimal("0.1"), rounding=ROUND_HALF_UP))
+
     async def prices(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """Step 3/5：解析并校验「原价, 折后价」，非法输入则停留在本步重问。"""
-        parts = update.message.text.replace("$", "").split(",")
+        """Step 3/5 手动输入：「原价, 折后价」一次输完；或者先输原价、再输折后价（也可以点折扣按钮）。"""
+        text = update.message.text
+        data = context.user_data
         try:
-            if len(parts) != 2:
+            if "," in text:
+                parts = text.split(",")
+                if len(parts) != 2:
+                    raise ValueError
+                original, discount = self._parse_price(parts[0]), self._parse_price(parts[1])
+            elif "original_price" not in data:
+                original, discount = self._parse_price(text), None
+            else:
+                original, discount = data["original_price"], self._parse_price(text)
+            if original <= 0 or original > MAX_PRICE:
                 raise ValueError
-            original = float(parts[0].strip())
-            discount = float(parts[1].strip())
-            # float() 也接受 "nan" / "inf"，需显式排除
-            if not (math.isfinite(original) and math.isfinite(discount)):
-                raise ValueError
-            if original <= 0 or original > MAX_PRICE or discount < 0 or discount > original:
+            if discount is not None and not 0 <= discount <= original:
                 raise ValueError
         except ValueError:
             await update.message.reply_text(
-                "❌ Invalid format. Please enter like `6.50, 3.00` "
-                f"(discount must not exceed original price; max ${MAX_PRICE}).",
+                "❌ Invalid price. Enter the original price like `6.50`, or both like `6.50, 3.00` "
+                f"(discount must not exceed the original price; max ${MAX_PRICE}).",
                 parse_mode=ParseMode.MARKDOWN,
             )
             return PRICES
 
-        context.user_data["original_price"] = original
+        data["original_price"] = original
+        if discount is None:
+            keyboard = [[
+                InlineKeyboardButton(f"{pct}% off · ${self._discounted(original, pct):.2f}",
+                                     callback_data=f"disc:{pct}")
+                for pct in DISCOUNT_OPTIONS[:2]
+            ], [
+                InlineKeyboardButton(f"{pct}% off · ${self._discounted(original, pct):.2f}",
+                                     callback_data=f"disc:{pct}")
+                for pct in DISCOUNT_OPTIONS[2:]
+            ]]
+            await update.message.reply_text(
+                f"💰 Original price: ${original:.2f}\n"
+                "Choose the discount, or type the discounted price (e.g. 3.00):",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+            return PRICES
+
+        data["discount_price"] = discount
+        return await self._ask_quantity(update)
+
+    async def pick_discount(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Step 3/5 点了折扣按钮。"""
+        query = update.callback_query
+        await query.answer()
+        pct = int(query.data.split(":")[1])
+        original = context.user_data.get("original_price")
+        if pct not in DISCOUNT_OPTIONS or original is None:
+            await query.edit_message_text("💰 Step 3/5: Please type the original price, e.g. 6.50")
+            context.user_data.pop("original_price", None)
+            return PRICES
+        discount = self._discounted(original, pct)
         context.user_data["discount_price"] = discount
-        await update.message.reply_text("📦 Step 4/5: How many portions are available?")
+        return await self._ask_quantity(
+            update, f"💰 ${original:.2f} → ${discount:.2f} ({pct}% off)\n\n"
+        )
+
+    async def _ask_quantity(self, update: Update, prefix: str = "") -> int:
+        """Step 4/5：问份数，提供常用数字按钮。"""
+        keyboard = [[
+            InlineKeyboardButton(str(n), callback_data=f"qty:{n}") for n in QUANTITY_OPTIONS
+        ]]
+        await self._reply_step(
+            update,
+            f"{prefix}📦 Step 4/5: How many portions are available?\nTap a number or type one.",
+            InlineKeyboardMarkup(keyboard),
+        )
         return QUANTITY
 
     async def quantity(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """Step 4/5：解析数量（正整数）。"""
+        """Step 4/5 手动输入：解析数量（正整数）。"""
         try:
             qty = int(update.message.text.strip())
             if not 0 < qty <= MAX_QUANTITY:
@@ -266,14 +402,45 @@ class VendorBot:
             return QUANTITY
 
         context.user_data["quantity"] = qty
-        await update.message.reply_text(
-            "🕖 Step 5/5: What's the pickup window?\ne.g. `7:30 PM - 8:30 PM`",
-            parse_mode=ParseMode.MARKDOWN,
+        return await self._ask_pickup(update, context)
+
+    async def pick_quantity(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Step 4/5 点了份数按钮。"""
+        query = update.callback_query
+        await query.answer()
+        qty = int(query.data.split(":")[1])
+        if qty not in QUANTITY_OPTIONS:
+            return await self._ask_quantity(update)
+        context.user_data["quantity"] = qty
+        return await self._ask_pickup(update, context, f"📦 {qty} portion(s)\n\n")
+
+    @staticmethod
+    def _pickup_windows() -> list[str]:
+        """从现在开始的几个取餐窗口（结束时间向上取整到 5 分钟），都不晚于提醒学生吃完的时间。"""
+        now = datetime.now(SG_TZ).replace(second=0, microsecond=0)
+        latest = now + EAT_WITHIN
+        windows = []
+        for minutes in PICKUP_WINDOW_MINUTES:
+            end = now + timedelta(minutes=minutes)
+            end += timedelta(minutes=-end.minute % 5)
+            windows.append(f"{fmt_sg_time(now)} - {fmt_sg_time(min(end, latest))}")
+        return windows
+
+    async def _ask_pickup(self, update: Update, context: ContextTypes.DEFAULT_TYPE, prefix: str = "") -> int:
+        """Step 5/5：问取餐时间，提供从现在开始的几个窗口。"""
+        windows = self._pickup_windows()
+        context.user_data["windows"] = windows
+        keyboard = [[InlineKeyboardButton(f"🕖 {w}", callback_data=f"win:{i}")] for i, w in enumerate(windows)]
+        await self._reply_step(
+            update,
+            f"{prefix}🕖 Step 5/5: What's the pickup window?\n"
+            "Tap one, or type your own (e.g. 7:30 PM - 8:30 PM).",
+            InlineKeyboardMarkup(keyboard),
         )
         return PICKUP_WINDOW
 
     async def pickup_window(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """Step 5/5：保存 listing 到 Supabase 并通知 vendor。"""
+        """Step 5/5 手动输入取餐时间。"""
         pickup = update.message.text.strip()
         if len(pickup) > MAX_PICKUP_LEN:
             await update.message.reply_text(
@@ -281,7 +448,20 @@ class VendorBot:
                 parse_mode=ParseMode.MARKDOWN,
             )
             return PICKUP_WINDOW
+        return await self._publish(update, context, pickup)
 
+    async def pick_window(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Step 5/5 点了取餐窗口按钮。"""
+        query = update.callback_query
+        await query.answer()
+        windows = context.user_data.get("windows", [])
+        idx = int(query.data.split(":")[1])
+        if not 0 <= idx < len(windows):
+            return await self._ask_pickup(update, context)
+        return await self._publish(update, context, windows[idx])
+
+    async def _publish(self, update: Update, context: ContextTypes.DEFAULT_TYPE, pickup: str) -> int:
+        """保存 listing 到 Supabase 并通知 vendor。"""
         data = {
             "stall_id": context.user_data["stall_id"],
             "title": context.user_data["title"],
@@ -303,13 +483,13 @@ class VendorBot:
             stall = (stall_res.data or [{}])[0]
         except Exception as exc:
             logger.error("保存 listing 失败: %s", exc)
-            await update.message.reply_text(
-                "⚠️ Failed to save the listing. Please try again.",
-                reply_markup=VENDOR_MENU,
+            await self._reply_step(
+                update, "⚠️ Failed to save the listing. Please try again.", VENDOR_MENU
             )
             return ConversationHandler.END
 
-        await update.message.reply_text(
+        await self._reply_step(
+            update,
             "✅ Listing published!\n\n"
             f"🍽️ {data['title']}\n"
             f"🏪 {stall.get('stall_name', 'N/A')} — {stall.get('canteen_location', 'N/A')}\n"
@@ -317,7 +497,7 @@ class VendorBot:
             f"📦 {data['quantity']} portions\n"
             f"🕖 {data['pickup_time']}\n\n"
             "Students can now find it under Browse Available Food.",
-            reply_markup=VENDOR_MENU,
+            VENDOR_MENU,
         )
         context.user_data.clear()
         return ConversationHandler.END
@@ -714,10 +894,22 @@ def main() -> None:
         ],
         states={
             SELECT_STALL: [CallbackQueryHandler(bot.select_stall, pattern=r"^stall:")],
-            MEAL_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot.meal_title)],
-            PRICES: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot.prices)],
-            QUANTITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot.quantity)],
-            PICKUP_WINDOW: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot.pickup_window)],
+            MEAL_TITLE: [
+                CallbackQueryHandler(bot.pick_recent, pattern=r"^recent:\d+$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, bot.meal_title),
+            ],
+            PRICES: [
+                CallbackQueryHandler(bot.pick_discount, pattern=r"^disc:\d+$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, bot.prices),
+            ],
+            QUANTITY: [
+                CallbackQueryHandler(bot.pick_quantity, pattern=r"^qty:\d+$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, bot.quantity),
+            ],
+            PICKUP_WINDOW: [
+                CallbackQueryHandler(bot.pick_window, pattern=r"^win:\d+$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, bot.pickup_window),
+            ],
             VERIFY_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot.verify_code)],
         },
         fallbacks=[
