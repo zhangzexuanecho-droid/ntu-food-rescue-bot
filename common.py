@@ -40,6 +40,9 @@ SG_TZ = ZoneInfo("Asia/Singapore")
 # 再留 1 小时余量，所以提醒学生在发布后 3 小时内吃完。
 EAT_WITHIN = timedelta(hours=3)
 
+# 预订后多久还没来领就自动取消，把那一份放回库存给别的学生
+RELEASE_AFTER = timedelta(minutes=30)
+
 
 def is_demo_stall(stall: dict | None) -> bool:
     """没有绑定商家（vendor_telegram_id 为空）的摊位算 demo，它的餐品不受日期限制。"""

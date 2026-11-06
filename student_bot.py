@@ -12,7 +12,7 @@
 import logging
 import secrets
 import string
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from postgrest import APIError
 from telegram import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -25,6 +25,7 @@ from telegram.ext import (
 )
 
 from common import (
+    RELEASE_AFTER,
     eat_by,
     fmt_sg_time,
     get_admin_ids,
@@ -55,6 +56,11 @@ CLAIM_CODE_LENGTH = 6
 
 # PostgreSQL unique_violation 错误码
 UNIQUE_VIOLATION = "23505"
+
+# 超时释放的检查间隔；只通知过期不到这么久的预订，上线前积压的旧预订静默取消，不打扰学生
+RELEASE_CHECK_INTERVAL = 60
+RELEASE_MINUTES = int(RELEASE_AFTER.total_seconds() // 60)
+RELEASE_NOTIFY_WINDOW = timedelta(hours=1)
 
 
 class StudentBot:
@@ -249,7 +255,9 @@ class StudentBot:
             f"🍽️ {listing['title']}\n"
             f"📍 {stall.get('stall_name', 'N/A')} — {stall.get('canteen_location', 'N/A')}\n"
             f"🕖 Pickup: {listing.get('pickup_time') or 'TBA'}\n"
-            f"⏰ Please eat by {fmt_sg_time(deadline)} (food safety)\n\n"
+            f"⏰ Please eat by {fmt_sg_time(deadline)} (food safety)\n"
+            f"⌛ Collect within {RELEASE_MINUTES} minutes (by {fmt_sg_time(datetime.now(timezone.utc) + RELEASE_AFTER)}), "
+            "or it will be released to other students.\n\n"
             f"🎟️ Your Claim Code: {claim_code}\n\n"
             "Show this code at the stall to collect your meal. Enjoy!"
         )
@@ -274,10 +282,13 @@ class StudentBot:
         UPDATE ... SET quantity = q + delta WHERE id = ? AND quantity = q。
         期间若被其他请求改过，WHERE 不命中，重读后重试，因此不会丢失扣减，也不会超卖。
         listing 不存在或库存不足时返回 False。
+
+        商家下架（stopped = true）的 listing 一律不改：否则超时释放或预订失败回补库存时会把已下架的菜
+        重新放出来。WHERE 里也带上 stopped = false，防止「读到库存之后、写回之前」商家正好下架。
         """
         for _ in range(5):
-            res = self.supabase.table("listings").select("quantity").eq("id", listing_id).execute()
-            if not res.data:
+            res = self.supabase.table("listings").select("quantity, stopped").eq("id", listing_id).execute()
+            if not res.data or res.data[0].get("stopped"):
                 return False
             qty = int(res.data[0]["quantity"])
             if qty + delta < 0:
@@ -287,6 +298,7 @@ class StudentBot:
                 .update({"quantity": qty + delta})
                 .eq("id", listing_id)
                 .eq("quantity", qty)
+                .eq("stopped", False)
                 .execute()
             )
             if updated.data:
@@ -320,6 +332,59 @@ class StudentBot:
                 if exc.code != UNIQUE_VIOLATION:
                     raise  # 网络、外键等其他错误重试也没用，直接抛出
         raise RuntimeError("无法生成唯一 claim_code")
+
+    async def release_expired(self, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """定时任务：预订后超过 RELEASE_AFTER 还没领的，改为 cancelled，把那一份放回库存，并通知学生。
+
+        取消用条件更新（WHERE status = 'pending'），商家同时核销时只有一方生效；cancelled 不计入每天一份，
+        所以学生还能再订。只通知刚过期不久的预订，很久以前积压的只静默取消。
+        """
+        now = datetime.now(timezone.utc)
+        cutoff = (now - RELEASE_AFTER).strftime("%Y-%m-%dT%H:%M:%SZ")
+        try:
+            rows = (
+                self.supabase.table("reservations")
+                .select("id, listing_id, student_telegram_id, claim_code, created_at, listings(title)")
+                .eq("status", "pending")
+                .lt("created_at", cutoff)
+                .execute()
+                .data or []
+            )
+        except Exception as exc:
+            logger.warning("查询超时预订失败: %s", exc)
+            return
+
+        released = 0
+        for r in rows:
+            try:
+                updated = (
+                    self.supabase.table("reservations")
+                    .update({"status": "cancelled"})
+                    .eq("id", r["id"])
+                    .eq("status", "pending")
+                    .execute()
+                )
+                if not updated.data:
+                    continue  # 刚好被商家核销了
+                self._release_stock(r["listing_id"])
+                released += 1
+            except Exception as exc:
+                logger.error("释放预订失败 id=%s: %s", r["id"], exc)
+                continue
+            if parse_ts(r["created_at"]) < now - RELEASE_AFTER - RELEASE_NOTIFY_WINDOW:
+                continue
+            title = (r.get("listings") or {}).get("title", "your meal")
+            try:
+                await context.bot.send_message(
+                    r["student_telegram_id"],
+                    f"⌛ Your reservation for {title} (code {r['claim_code']}) wasn't collected within "
+                    f"{RELEASE_MINUTES} minutes, so it has been released to other students.\n\n"
+                    "You can reserve another meal anytime 🍱",
+                )
+            except Exception as exc:
+                logger.warning("通知学生失败 telegram_id=%s: %s", r["student_telegram_id"], exc)
+        if released:
+            logger.info("已释放 %d 条超时未领的预订", released)
 
     # ------------------------------------------------------------------
     # 我的预订
@@ -369,7 +434,8 @@ class StudentBot:
                 f"{i}. {listing.get('title', 'N/A')}\n"
                 f"   🎟️ {r['claim_code']} | 📍 {stall.get('canteen_location', 'N/A')}\n"
                 f"   🕖 {listing.get('pickup_time') or 'TBA'} | Status: {r['status']}\n"
-                f"   ⏰ Eat by {fmt_sg_time(deadline)}\n"
+                f"   ⌛ Collect by {fmt_sg_time(parse_ts(r['created_at']) + RELEASE_AFTER)} | "
+                f"⏰ Eat by {fmt_sg_time(deadline)}\n"
             )
 
         await query.edit_message_text(
@@ -397,6 +463,9 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(bot.reserve, pattern=r"^reserve:"))
     application.add_handler(CallbackQueryHandler(bot.back_to_menu, pattern="^back_menu$"))
     schedule_db_keepalive(application, bot.supabase)
+    application.job_queue.run_repeating(
+        bot.release_expired, interval=RELEASE_CHECK_INTERVAL, first=30, name="release-expired"
+    )
 
     logger.info("Student Bot 启动中...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)

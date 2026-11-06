@@ -16,6 +16,7 @@ A campus version of Too Good To Go for NTU: food stalls list surplus meals at a 
 - Reservations decrement stock with a compare-and-swap update (`WHERE quantity = <value just read>`, retried on conflict), so concurrent reservations can't oversell; if saving the reservation fails, the portion is put back. Unique 6-character claim codes for collection
 - **Same-day only (optional)** — with `SAME_DAY_ONLY=true` in `.env`, only listings published today (Singapore time) can be browsed or reserved, and only today's reservations can be collected; earlier ones expire. Off by default so demo data stays visible; turn it on for a real pilot. Stalls not linked to a vendor (`vendor_telegram_id` empty) count as demo stalls and are always exempt
 - **Eat-by reminder** — the reservation confirmation, My Reservations and the vendor's verify reply show when the meal should be eaten: listing time + 3 hours (food is assumed freshly cooked when listed; 1 hour of margin under SFA's 4-hour rule). For demo stalls it is reservation time + 3 hours. After a vendor verifies a code, the student bot also messages the student this reminder
+- **Auto-release** — a reservation not collected within 30 minutes is cancelled, its portion goes back on sale and the student is notified (the student can reserve again). A stopped listing (`stopped = true`) is never restocked, neither by a release nor by a failed-reservation rollback
 - **Daily limit** — each student can reserve 1 meal per day (pending or collected); admin Telegram IDs are exempt so the bots can be tested and demoed
 
 ## Project layout
@@ -54,6 +55,15 @@ A campus version of Too Good To Go for NTU: food stalls list surplus meals at a 
    Only one instance of each bot may run at a time — a second one fails with a Telegram `Conflict` error.
 
 > Free-tier Supabase projects are paused after a week of low database activity. While running, each bot queries the database every 6 hours to keep the project active (Supabase doesn't guarantee that automated traffic counts — only paid plans are exempt from pausing). If the bots log DNS errors such as `nodename nor servname provided`, restore the project from the Supabase dashboard; the bots reconnect on their own.
+
+## Database migrations
+
+Existing projects created from an older `schema.sql` need these, run once in the Supabase SQL Editor **before** deploying the matching code:
+
+```sql
+-- 2026-11: stop-selling flag (auto-release must not restock stopped listings)
+alter table public.listings add column if not exists stopped boolean not null default false;
+```
 
 ## Run 24/7 on a Linux machine
 

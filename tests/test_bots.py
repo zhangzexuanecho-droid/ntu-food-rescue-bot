@@ -2,8 +2,8 @@
 
 No Telegram or Supabase connection needed. Put this file at tests/test_bots.py and run from the repo root:
 
-    uv run python tests/test_bots.py                      # SAME_DAY_ONLY off (demo mode): 5 + 6 eat-by + 6 my-listings + 6 publish scenarios
-    SAME_DAY_ONLY=true uv run python tests/test_bots.py   # SAME_DAY_ONLY on: 16 + 6 eat-by + 6 my-listings + 6 publish scenarios
+    uv run python tests/test_bots.py                      # SAME_DAY_ONLY off (demo mode): 5 + 6 eat-by + 6 my-listings + 6 publish + 6 release scenarios
+    SAME_DAY_ONLY=true uv run python tests/test_bots.py   # SAME_DAY_ONLY on: 16 + 6 eat-by + 6 my-listings + 6 publish + 6 release scenarios
 """
 
 import asyncio
@@ -40,6 +40,8 @@ class FakeDB:
         self.tables = {"stalls": [], "listings": [], "reservations": []}
 
     def table(self, name):
+        for row in self.tables["listings"]:  # column default: stopped = false
+            row.setdefault("stopped", False)
         return Query(self, name)
 
     def embed(self, name, row):
@@ -77,6 +79,7 @@ class Query:
     def neq(self, c, v): return self._f(lambda r: r.get(c) != v)
     def gt(self, c, v): return self._f(lambda r: r.get(c) > v)
     def gte(self, c, v): return self._f(lambda r: r.get(c) >= v)
+    def lt(self, c, v): return self._f(lambda r: r.get(c) < v)
     def in_(self, c, vals): return self._f(lambda r: r.get(c) in vals)
     def order(self, *a, **k): return self
 
@@ -432,7 +435,8 @@ async def my_listings_checks():
     await vb.do_stop(u, ctx())
     text = u.callback_query.edit_message_text.call_args.args[0]
     rows = u.callback_query.edit_message_text.call_args.kwargs["reply_markup"].inline_keyboard
-    assert listings["today1"]["quantity"] == 0 and text.startswith("🛑 Stopped selling Chicken Rice Set")
+    assert listings["today1"]["quantity"] == 0 and listings["today1"]["stopped"] is True
+    assert text.startswith("🛑 Stopped selling Chicken Rice Set") and "· 🛑 Stopped" in text
     assert "Left 0" in text and not any("Chicken Rice Set" in b.text for row in rows for b in row)
     assert u.callback_query.answer.await_count == 1
     u = cb_update("browse", 50)
@@ -545,11 +549,73 @@ async def publish_checks():
     print("\nALL PASSED (publish)")
 
 
+async def release_checks():
+    """Auto-release of reservations not collected within RELEASE_AFTER, and stopped listings never restocked."""
+    db = seed()
+    now = datetime.now(timezone.utc)
+    expired = ts(now - common.RELEASE_AFTER - timedelta(minutes=5))
+    fresh = ts(now - timedelta(minutes=10))
+    db.tables["listings"].append(
+        {"id": "stopped1", "stall_id": "s1", "title": "Stopped Dish", "original_price": 5, "discount_price": 2,
+         "quantity": 0, "pickup_time": "8-9pm", "created_at": NOW, "stopped": True})
+    db.tables["reservations"] += [
+        {"id": "r_exp", "listing_id": "today2", "student_telegram_id": 61, "claim_code": "EXP111",
+         "status": "pending", "created_at": expired},
+        {"id": "r_fresh", "listing_id": "today2", "student_telegram_id": 62, "claim_code": "FRS111",
+         "status": "pending", "created_at": fresh},
+        {"id": "r_stop", "listing_id": "stopped1", "student_telegram_id": 63, "claim_code": "STP111",
+         "status": "pending", "created_at": expired},
+    ]
+    student_bot.get_supabase = lambda: db
+    vendor_bot.get_supabase = lambda: db
+    sb, vb = student_bot.StudentBot(), vendor_bot.VendorBot()
+    vb._notify_student = AsyncMock()
+    listings = {l["id"]: l for l in db.tables["listings"]}
+    res = {r["id"]: r for r in db.tables["reservations"]}
+
+    job_ctx = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock()))
+    await sb.release_expired(job_ctx)
+    assert res["r_exp"]["status"] == "cancelled" and listings["today2"]["quantity"] == 4
+    assert res["r_fresh"]["status"] == "pending"
+    print("✓ expired reservation released, portion back in stock; fresh one kept")
+
+    assert res["r_stop"]["status"] == "cancelled" and listings["stopped1"]["quantity"] == 0
+    print("✓ releasing on a stopped listing doesn't restock it")
+
+    # yesterday's pending reservation (r_old) is cancelled silently; recent ones are notified
+    notified = {c.args[0] for c in job_ctx.bot.send_message.await_args_list}
+    assert res["r_old"]["status"] == "cancelled" and 7 not in notified and {61, 63} <= notified, notified
+    assert "wasn't collected within 30 minutes" in job_ctx.bot.send_message.await_args_list[0].args[1]
+    print("✓ recent releases notified, old backlog cancelled silently")
+
+    # the released student can reserve again today (cancelled doesn't count toward the limit)
+    u = cb_update("reserve:today1", 61)
+    await sb.reserve(u, ctx())
+    reply = u.callback_query.message.reply_text.call_args.args[0]
+    assert "Reservation confirmed" in reply and "Collect within 30 minutes" in reply, reply
+    print("✓ released student can reserve again; confirmation shows the 30-minute rule")
+
+    # vendor verifying a released code is told why
+    u = msg_update("EXP111", 102)  # today2 belongs to stall s2 (vendor 102)
+    await vb._handle_code(u, "EXP111")
+    assert "released to other students" in u.message.reply_text.call_args.args[0]
+    print("✓ vendor told a released code was released")
+
+    # Copilot #4 race: a failed reservation's rollback can't reopen a listing stopped meanwhile
+    listings["today2"].update(quantity=0, stopped=True)
+    sb._release_stock("today2")
+    assert listings["today2"]["quantity"] == 0
+    print("✓ rollback can't reopen a stopped listing")
+
+    print("\nALL PASSED (release)")
+
+
 async def run():
     await (main() if common.same_day_only() else demo_mode())
     await eat_by_checks()
     await my_listings_checks()
     await publish_checks()
+    await release_checks()
 
 
 asyncio.run(run())

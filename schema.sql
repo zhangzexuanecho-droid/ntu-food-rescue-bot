@@ -24,6 +24,8 @@ create table if not exists public.listings (
     original_price numeric(10, 2) not null check (original_price >= 0),
     discount_price numeric(10, 2) not null check (discount_price >= 0 and discount_price <= original_price),
     quantity       integer not null default 0 check (quantity >= 0),
+    -- 商家提前下架后为 true：超时释放、预订失败回补库存都不会再把它放出来
+    stopped        boolean not null default false,
     pickup_time    text,
     -- 注意：原需求为 timestamp，此处改用 timestamptz 以正确存储时区信息
     -- （Supabase 官方约定）。如必须使用 timestamp，把类型改回即可。

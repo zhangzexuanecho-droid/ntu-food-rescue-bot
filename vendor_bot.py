@@ -32,6 +32,7 @@ from telegram.warnings import PTBUserWarning
 
 from common import (
     EAT_WITHIN,
+    RELEASE_AFTER,
     SG_TZ,
     eat_by,
     fmt_sg_time,
@@ -616,7 +617,10 @@ class VendorBot:
             "already_completed": (
                 f"⚠️ Code {code} has already been used — this meal was collected earlier."
             ),
-            "cancelled": f"⚠️ The reservation for code {code} was cancelled.",
+            "cancelled": (
+                f"⚠️ The reservation for code {code} was cancelled — it wasn't collected within "
+                f"{int(RELEASE_AFTER.total_seconds() // 60)} minutes and was released to other students."
+            ),
             "expired": (
                 f"⌛ Code {code} is from a previous day and has expired.\n"
                 "Only meals reserved today can be collected."
@@ -695,7 +699,7 @@ class VendorBot:
         「可见」与学生端一致：SAME_DAY_ONLY 打开时只看今天发布的（demo 摊位除外），卖完的也列出来。
         """
         q = self.supabase.table("listings").select(
-            "id, title, quantity, pickup_time, created_at, stall_id, "
+            "id, title, quantity, pickup_time, created_at, stall_id, stopped, "
             "stalls(stall_name, vendor_telegram_id)"
         )
         if not is_admin:
@@ -784,9 +788,10 @@ class VendorBot:
                 f"   🏪 {stall.get('stall_name', 'N/A')} · listed {fmt_sg_time(parse_ts(item['created_at']))}\n"
                 f"   🕖 {item.get('pickup_time') or 'TBA'}\n"
                 f"   📦 Listed {item['listed']} · 🟡 Reserved {item['reserved']} · "
-                f"✅ Collected {item['collected']} · Left {item['quantity']}\n"
+                f"✅ Collected {item['collected']} · Left {item['quantity']}"
+                + (" · 🛑 Stopped" if item.get("stopped") else "") + "\n"
             )
-            if item["quantity"] > 0:
+            if item["quantity"] > 0 and not item.get("stopped"):
                 keyboard.append([InlineKeyboardButton(
                     f"🛑 Stop selling #{n}: {item['title'][:30]}",
                     callback_data=f"stop:{item['id']}:{page}",
@@ -858,7 +863,7 @@ class VendorBot:
         try:
             listing = self._own_listing(listing_id, update.effective_user.id)
             if listing is not None:
-                self.supabase.table("listings").update({"quantity": 0}).eq("id", listing_id).execute()
+                self.supabase.table("listings").update({"quantity": 0, "stopped": True}).eq("id", listing_id).execute()
         except Exception as exc:
             logger.error("下架失败 id=%s: %s", listing_id, exc)
             await query.answer("⚠️ Something went wrong. Please try again.", show_alert=True)
