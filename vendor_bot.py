@@ -1,5 +1,5 @@
 """
-商家端 Bot（NTU Food Rescue）：五步发布剩余餐食。
+商家端 Bot（NTU Food Rescue）：五步发布剩余餐食；学生取餐时核销 claim code。
 
 运行：
     python vendor_bot.py
@@ -26,7 +26,13 @@ from telegram.ext import (
 )
 from telegram.warnings import PTBUserWarning
 
-from common import get_admin_ids, get_bot_token, get_supabase, schedule_db_keepalive
+from common import (
+    get_admin_ids,
+    get_bot_token,
+    get_supabase,
+    schedule_db_keepalive,
+    today_start_utc,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,8 +40,11 @@ logger = logging.getLogger(__name__)
 # （per_message=False），这正是预期行为；屏蔽 PTB 针对这种组合的提示性警告。
 filterwarnings("ignore", message=r"If 'per_message=False'", category=PTBUserWarning)
 
-# 发布流程的五个对话状态
-(SELECT_STALL, MEAL_TITLE, PRICES, QUANTITY, PICKUP_WINDOW) = range(5)
+# 对话状态：发布流程的五步 + 核销时等待输入 claim code
+(SELECT_STALL, MEAL_TITLE, PRICES, QUANTITY, PICKUP_WINDOW, VERIFY_CODE) = range(6)
+
+# 与学生端生成规则一致：6 位大写字母 + 数字
+CLAIM_CODE_LENGTH = 6
 
 # 输入上限：标题、取餐时间太长会撑大学生端列表；价格、数量过大会超出数据库
 # numeric(10,2) / integer 的范围，要到最后一步保存时才报错
@@ -46,7 +55,10 @@ MAX_QUANTITY = 999
 
 # 商家端主菜单
 VENDOR_MENU = InlineKeyboardMarkup(
-    [[InlineKeyboardButton("➕ Add Surplus Meal", callback_data="add_meal")]]
+    [
+        [InlineKeyboardButton("➕ Add Surplus Meal", callback_data="add_meal")],
+        [InlineKeyboardButton("🎟️ Verify Claim Code", callback_data="verify")],
+    ]
 )
 
 
@@ -288,10 +300,146 @@ class VendorBot:
         context.user_data.clear()
         return ConversationHandler.END
 
-    async def cancel_add(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """/cancel 命令退出发布流程。"""
+    # ------------------------------------------------------------------
+    # 核销 claim code（学生到摊位出示核销码，vendor 输入后标记为已领取）
+    # ------------------------------------------------------------------
+
+    async def start_verify(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """核销入口：按钮或 /verify。/verify ABC123 带参数时直接核销，否则提示输入核销码。"""
+        if update.callback_query is not None:
+            await update.callback_query.answer()
         context.user_data.clear()
-        await update.message.reply_text("❌ Listing cancelled.", reply_markup=VENDOR_MENU)
+        vendor_id = update.effective_user.id
+
+        if vendor_id not in get_admin_ids():
+            try:
+                linked = (
+                    self.supabase.table("stalls")
+                    .select("id")
+                    .eq("vendor_telegram_id", vendor_id)
+                    .limit(1)
+                    .execute()
+                ).data
+            except Exception as exc:
+                logger.error("查询 stalls 失败 vendor_id=%s: %s", vendor_id, exc)
+                await self._fail(update, "⚠️ Something went wrong. Please try again.")
+                return ConversationHandler.END
+            if not linked:
+                await self._fail(
+                    update,
+                    "🔒 You are not linked to any stall yet.\n\n"
+                    f"Your vendor ID is {vendor_id} — send it to the admin "
+                    "so they can link your stall to your account.",
+                )
+                return ConversationHandler.END
+
+        if context.args:
+            return await self._handle_code(update, " ".join(context.args))
+
+        await self._reply_step(
+            update,
+            "🎟️ Enter the student's 6-character claim code:\n(/cancel to exit)",
+        )
+        return VERIFY_CODE
+
+    async def verify_code(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """VERIFY_CODE 状态下收到的文本即核销码。"""
+        return await self._handle_code(update, update.message.text)
+
+    async def _handle_code(self, update: Update, raw: str) -> int:
+        """校验格式 → 核销 → 回复结果。码不存在或格式不对时停留在 VERIFY_CODE 让 vendor 重输。"""
+        message = update.effective_message
+        code = "".join(raw.split()).upper()
+        if len(code) != CLAIM_CODE_LENGTH or not (code.isascii() and code.isalnum()):
+            await message.reply_text(
+                f"❌ A claim code has {CLAIM_CODE_LENGTH} letters/digits, e.g. `K7Q2XM`. "
+                "Please try again, or /cancel.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return VERIFY_CODE
+
+        vendor_id = update.effective_user.id
+        try:
+            result, reservation = self._verify_claim(
+                code, vendor_id, vendor_id in get_admin_ids()
+            )
+        except Exception as exc:
+            logger.error("核销失败 code=%s: %s", code, exc)
+            await message.reply_text(
+                "⚠️ Something went wrong. Please try again.", reply_markup=VENDOR_MENU
+            )
+            return ConversationHandler.END
+
+        if result == "not_found":
+            await message.reply_text(
+                f"❌ Code {code} was not found for your stall.\n\n"
+                "Please check the code and try again, or /cancel."
+            )
+            return VERIFY_CODE
+
+        listing = reservation.get("listings") or {}
+        stall = listing.get("stalls") or {}
+        replies = {
+            "ok": (
+                f"✅ Code {code} verified!\n\n"
+                f"Please hand over: 🍽️ {listing.get('title', 'N/A')}\n"
+                f"🏪 {stall.get('stall_name', 'N/A')}\n\n"
+                "Marked as collected."
+            ),
+            "already_completed": (
+                f"⚠️ Code {code} has already been used — this meal was collected earlier."
+            ),
+            "cancelled": f"⚠️ The reservation for code {code} was cancelled.",
+            "expired": (
+                f"⌛ Code {code} is from a previous day and has expired.\n"
+                "Only meals reserved today can be collected."
+            ),
+        }
+        await message.reply_text(replies[result], reply_markup=VENDOR_MENU)
+        return ConversationHandler.END
+
+    def _verify_claim(self, code: str, vendor_id: int, is_admin: bool) -> tuple[str, dict | None]:
+        """核销一个 claim code，返回 (结果, 预订记录)。
+
+        结果取值：ok / not_found / already_completed / cancelled / expired。
+        普通 vendor 只能核销自己摊位的码；别的摊位的码一律当作 not_found，不泄露它是否存在。
+        """
+        res = (
+            self.supabase.table("reservations")
+            .select("id, status, listings(title, stalls(stall_name, vendor_telegram_id))")
+            .eq("claim_code", code)
+            .execute()
+        )
+        if not res.data:
+            return "not_found", None
+        reservation = res.data[0]
+        stall = (reservation.get("listings") or {}).get("stalls") or {}
+        if not is_admin and stall.get("vendor_telegram_id") != vendor_id:
+            return "not_found", None
+        if reservation["status"] == "completed":
+            return "already_completed", reservation
+        if reservation["status"] != "pending":
+            return "cancelled", reservation
+
+        # 条件更新：只有今天的 pending 预订才能核销。WHERE 带上 status = 'pending'，
+        # 同一个码被重复提交时只有第一次生效，不会被领两次
+        updated = (
+            self.supabase.table("reservations")
+            .update({"status": "completed"})
+            .eq("id", reservation["id"])
+            .eq("status", "pending")
+            .gte("created_at", today_start_utc())
+            .execute()
+        )
+        if updated.data:
+            return "ok", reservation
+        # PTB 逐个处理 update，期间唯一可能改动 status 的是本 bot 自己，所以没更新到就是过期了
+        return "expired", reservation
+
+    async def cancel_add(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """/cancel 命令退出当前流程（发布或核销）。"""
+        context.user_data.clear()
+        await update.message.reply_text("❌ Cancelled.", reply_markup=VENDOR_MENU)
         return ConversationHandler.END
 
     async def cancel_add_cb(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -314,11 +462,15 @@ def main() -> None:
     """构建商家端 Application 并注册全部 handler。"""
     bot = VendorBot()
 
+    # 发布与核销放在同一个 ConversationHandler 里：任一流程中途点另一个入口时直接切换过去，
+    # 否则旧流程的状态还在，vendor 输入的核销码会被当成餐品名之类处理
     vendor_conv = ConversationHandler(
-        # 由主菜单按钮触发；同时保留 /add 命令作为快捷入口
+        # 由主菜单按钮触发；同时保留 /add、/verify 命令作为快捷入口
         entry_points=[
             CallbackQueryHandler(bot.start_add_meal, pattern="^add_meal$"),
             CommandHandler("add", bot.start_add_meal),
+            CallbackQueryHandler(bot.start_verify, pattern="^verify$"),
+            CommandHandler("verify", bot.start_verify),
         ],
         states={
             SELECT_STALL: [CallbackQueryHandler(bot.select_stall, pattern=r"^stall:")],
@@ -326,6 +478,7 @@ def main() -> None:
             PRICES: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot.prices)],
             QUANTITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot.quantity)],
             PICKUP_WINDOW: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot.pickup_window)],
+            VERIFY_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot.verify_code)],
         },
         fallbacks=[
             CommandHandler("cancel", bot.cancel_add),

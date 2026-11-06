@@ -7,7 +7,8 @@
 
 import logging
 import os
-from datetime import timedelta
+from datetime import datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from supabase import Client, create_client
@@ -30,6 +31,18 @@ logger = logging.getLogger(__name__)
 # Supabase 免费版一周内数据库活动太少就会自动暂停项目（官方说法：通常每天有几次请求就够）。
 # 每个 bot 每 6 小时查一次库，没人使用 bot 时数据库也保持活跃。
 KEEPALIVE_INTERVAL = timedelta(hours=6)
+
+# 「今天」按新加坡时间算：只有当天发布的餐品可以浏览、预订、核销（食品安全：只卖当天做的食物）
+SG_TZ = ZoneInfo("Asia/Singapore")
+
+
+def today_start_utc() -> str:
+    """新加坡时间今天 00:00 对应的 UTC 时间字符串，用作 created_at >= 的筛选条件。
+
+    用 UTC + 'Z' 而不是 '+08:00'：'+' 放进 URL 查询参数可能被解析成空格，导致 PostgREST 报错。
+    """
+    sg_midnight = datetime.combine(datetime.now(SG_TZ).date(), time.min, tzinfo=SG_TZ)
+    return sg_midnight.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def get_supabase() -> Client:

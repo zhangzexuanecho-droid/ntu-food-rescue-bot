@@ -23,7 +23,13 @@ from telegram.ext import (
     ContextTypes,
 )
 
-from common import get_bot_token, get_supabase, schedule_db_keepalive
+from common import (
+    get_admin_ids,
+    get_bot_token,
+    get_supabase,
+    schedule_db_keepalive,
+    today_start_utc,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +101,9 @@ class StudentBot:
     # ------------------------------------------------------------------
 
     async def browse(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """查询 quantity > 0 的 listings（join stalls），分页展示并附 Reserve 按钮。
+        """查询今天发布且 quantity > 0 的 listings（join stalls），分页展示并附 Reserve 按钮。
+
+        之前日子没卖完的 listing 不再显示：只卖当天做的食物。
 
         callback_data 为 "browse"（第一页）或 "browse:<页码>"（翻页，页码从 0 开始）。
         """
@@ -112,6 +120,7 @@ class StudentBot:
                     "pickup_time, stalls(stall_name, canteen_location)"
                 )
                 .gt("quantity", 0)
+                .gte("created_at", today_start_utc())
                 .order("created_at", desc=True)
                 .execute()
             )
@@ -168,10 +177,14 @@ class StudentBot:
     async def reserve(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """
         处理 Reserve Now：
-          1. 取最新详情（列表页数据可能已过期）
-          2. CAS 扣减一份库存，售罄则弹窗提示
-          3. 写入 reservations（含 6 位随机 claim_code），写入失败则回补库存
-          4. 发送核销码确认消息
+          1. 取最新详情（列表页数据可能已过期；只接受今天发布的 listing）
+          2. 每个学生每天限订一份（管理员不受限，方便测试和演示）
+          3. CAS 扣减一份库存，售罄则弹窗提示
+          4. 写入 reservations（含 6 位随机 claim_code），写入失败则回补库存
+          5. 发送核销码确认消息
+
+        PTB 默认逐个处理 update（未开启 concurrent_updates），同一 bot 进程内不会有两次预订并发执行，
+        所以第 2 步「先查再写」不会被同一学生的连点绕过。
 
         一个 callback query 只能 answer 一次：失败分支用弹窗 answer，成功后再空 answer，
         不能在开头先 answer()，否则后面的弹窗会失败、用户看不到提示。
@@ -185,12 +198,21 @@ class StudentBot:
                 self.supabase.table("listings")
                 .select("id, title, quantity, pickup_time, stalls(stall_name, canteen_location)")
                 .eq("id", listing_id)
+                .gte("created_at", today_start_utc())
                 .execute()
             )
             if not res.data:
-                await query.answer("😔 This listing no longer exists.", show_alert=True)
+                await query.answer("😔 This listing is no longer available.", show_alert=True)
                 return
             listing = res.data[0]
+
+            if user.id not in get_admin_ids() and self._has_reservation_today(user.id):
+                await query.answer(
+                    "🙏 You've already reserved a meal today.\n\n"
+                    "To keep things fair, each student can reserve 1 meal per day.",
+                    show_alert=True,
+                )
+                return
 
             if not self._change_stock(listing_id, -1):
                 await query.answer("😔 Sorry, this item is sold out!", show_alert=True)
@@ -217,6 +239,19 @@ class StudentBot:
             f"🎟️ Your Claim Code: {claim_code}\n\n"
             "Show this code at the stall to collect your meal. Enjoy!"
         )
+
+    def _has_reservation_today(self, telegram_id: int) -> bool:
+        """该学生今天是否已有未取消的预订（pending 或 completed 都算）。"""
+        res = (
+            self.supabase.table("reservations")
+            .select("id")
+            .eq("student_telegram_id", telegram_id)
+            .neq("status", "cancelled")
+            .gte("created_at", today_start_utc())
+            .limit(1)
+            .execute()
+        )
+        return bool(res.data)
 
     def _change_stock(self, listing_id: str, delta: int) -> bool:
         """以 CAS（compare-and-swap）方式把库存改变 delta，返回是否成功。
@@ -277,7 +312,10 @@ class StudentBot:
     # ------------------------------------------------------------------
 
     async def my_reservations(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """查询当前用户 status = 'pending' 的预订（join listings → stalls）。"""
+        """查询当前用户今天 status = 'pending' 的预订（join listings → stalls）。
+
+        之前日子没领的预订已过期，不再显示；已核销（completed）的也不显示。
+        """
         query = update.callback_query
         await query.answer()
         user = query.from_user
@@ -291,6 +329,7 @@ class StudentBot:
                 )
                 .eq("student_telegram_id", user.id)
                 .eq("status", "pending")
+                .gte("created_at", today_start_utc())
                 .order("created_at", desc=True)
                 .execute()
             )
@@ -301,7 +340,7 @@ class StudentBot:
             return
 
         if not rows:
-            await self._render_menu(query, "📋 You have no pending reservations.\n\nGo rescue a meal! 🍱")
+            await self._render_menu(query, "📋 You have no pending reservations today.\n\nGo rescue a meal! 🍱")
             return
 
         lines = ["📋 Your Pending Reservations\n"]
