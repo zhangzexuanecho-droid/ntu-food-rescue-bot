@@ -2,8 +2,8 @@
 
 No Telegram or Supabase connection needed. Put this file at tests/test_bots.py and run from the repo root:
 
-    uv run python tests/test_bots.py                      # SAME_DAY_ONLY off (demo mode): 5 + 6 eat-by + 6 my-listings + 5 publish scenarios
-    SAME_DAY_ONLY=true uv run python tests/test_bots.py   # SAME_DAY_ONLY on: 16 + 6 eat-by + 6 my-listings + 5 publish scenarios
+    uv run python tests/test_bots.py                      # SAME_DAY_ONLY off (demo mode): 5 + 6 eat-by + 6 my-listings + 6 publish scenarios
+    SAME_DAY_ONLY=true uv run python tests/test_bots.py   # SAME_DAY_ONLY on: 16 + 6 eat-by + 6 my-listings + 6 publish scenarios
 """
 
 import asyncio
@@ -473,20 +473,21 @@ async def publish_checks():
     recent = {text: data for text, data in buttons(u)}
     label = next(t for t in recent if "Chicken Rice Set" in t)
     assert "$4.80 → $2.00" in label and any("Stale Curry" in t for t in recent)
-    assert await vb.pick_recent(cb_update("recent:99", 101), c) == vendor_bot.MEAL_TITLE  # forged index
+    assert await vb.pick_recent(cb_update(f"recent:{c.user_data['flow']}:99", 101), c) == vendor_bot.MEAL_TITLE  # forged index
     u = cb_update(recent[label], 101)
     assert await vb.pick_recent(u, c) == vendor_bot.QUANTITY
     assert "Step 4/5" in u.callback_query.edit_message_text.call_args.args[0]
     assert [t for t, _ in buttons(u)] == ["1", "2", "3", "5", "10"]
     print("✓ recent meal fills title + prices and skips to step 4")
 
-    assert await vb.pick_quantity(cb_update("qty:7", 101), c) == vendor_bot.QUANTITY  # not an option
-    u = cb_update("qty:5", 101)
+    assert await vb.pick_quantity(cb_update(f"qty:{c.user_data['flow']}:7", 101), c) == vendor_bot.QUANTITY  # not an option
+    u = cb_update(f"qty:{c.user_data['flow']}:5", 101)
     assert await vb.pick_quantity(u, c) == vendor_bot.PICKUP_WINDOW
     windows = [t.removeprefix("🕖 ") for t, _ in buttons(u)]
     assert len(windows) == 3 and len(set(windows)) == 3 and all(" - " in w for w in windows), windows
-    assert await vb.pick_window(cb_update("win:5", 101), c) == vendor_bot.PICKUP_WINDOW  # forged index
-    u = cb_update("win:1", 101)
+    assert await vb.pick_window(cb_update(f"win:{c.user_data['flow']}:5", 101), c) == vendor_bot.PICKUP_WINDOW  # forged index
+    old_flow_win = f"win:{c.user_data['flow']}:0"
+    u = cb_update(f"win:{c.user_data['flow']}:1", 101)
     assert await vb.pick_window(u, c) == ConversationHandler.END
     row = new()[-1]
     assert (row["title"], row["original_price"], row["discount_price"], row["quantity"], row["pickup_time"]) == \
@@ -500,17 +501,30 @@ async def publish_checks():
     assert await vb.meal_title(msg_update("Nasi Lemak", 101), c) == vendor_bot.PRICES
     u = msg_update("5.00", 101)
     assert await vb.prices(u, c) == vendor_bot.PRICES
-    assert ("50% off · $2.50", "disc:50") in buttons(u), buttons(u)
-    assert await vb.pick_discount(cb_update("disc:45", 101), c) == vendor_bot.PRICES  # not an option
+    assert ("50% off · $2.50", f"disc:{c.user_data['flow']}:50") in buttons(u), buttons(u)
+    assert await vb.pick_discount(cb_update(f"disc:{c.user_data['flow']}:45", 101), c) == vendor_bot.PRICES  # not an option
     assert "original_price" not in c.user_data
     await vb.prices(msg_update("5.00", 101), c)
-    assert await vb.pick_discount(cb_update("disc:50", 101), c) == vendor_bot.QUANTITY
+    assert await vb.pick_discount(cb_update(f"disc:{c.user_data['flow']}:50", 101), c) == vendor_bot.QUANTITY
     assert await vb.quantity(msg_update("3", 101), c) == vendor_bot.PICKUP_WINDOW
     assert await vb.pickup_window(msg_update("7:30 PM - 8:30 PM", 101), c) == ConversationHandler.END
     row = new()[-1]
     assert (row["title"], row["discount_price"], row["quantity"], row["pickup_time"]) == \
         ("Nasi Lemak", 2.5, 3, "7:30 PM - 8:30 PM"), row
     print("✓ typed title + discount button + typed quantity/pickup")
+
+    # buttons from an earlier publish flow are ignored (flow id mismatch), even if the index is in range
+    c = ctx()
+    await vb.start_add_meal(cb_update("add_meal", 101), c)
+    first_flow_recent = f"recent:{c.user_data['flow']}:0"
+    await vb.start_add_meal(cb_update("add_meal", 101), c)          # vendor restarts the flow
+    assert await vb.pick_recent(cb_update(first_flow_recent, 101), c) == vendor_bot.MEAL_TITLE
+    assert "title" not in c.user_data
+    c.user_data.update(title="X", original_price=5.0, discount_price=2.0, quantity=1, windows=["a", "b"])
+    before = len(db.tables["listings"])
+    assert await vb.pick_window(cb_update(old_flow_win, 101), c) == vendor_bot.PICKUP_WINDOW
+    assert len(db.tables["listings"]) == before
+    print("✓ stale buttons from an earlier flow are ignored")
 
     # typed discounted price, invalid input, and the old one-line format
     c = ctx()

@@ -11,6 +11,7 @@
 
 import logging
 import math
+import secrets
 from datetime import datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 from warnings import filterwarnings
@@ -76,6 +77,7 @@ LISTINGS_PAGE_SIZE = 5
 
 # 发布流程里可点的选项（都保留手动输入）
 MAX_RECENT_MEALS = 6                    # Step 2：最多显示几个以前发布过的菜
+RECENT_MEALS_LOOKBACK = 300             # Step 2：在最近多少条 listing 里去重挑选（同一道菜可能被反复发布）
 DISCOUNT_OPTIONS = (30, 40, 50, 60)     # Step 3：折扣百分比
 QUANTITY_OPTIONS = (1, 2, 3, 5, 10)     # Step 4：份数
 PICKUP_WINDOW_MINUTES = (30, 60, 120)   # Step 5：从现在开始的取餐窗口长度
@@ -145,6 +147,8 @@ class VendorBot:
         if update.callback_query is not None:
             await update.callback_query.answer()  # 回调必须 answer，否则客户端按钮会一直转圈
         context.user_data.clear()  # 允许中途重新进入流程，先清掉上次没走完的数据
+        # 本次发布流程的编号，写进各步按钮的 callback_data：旧消息里的按钮编号对不上，会被忽略
+        context.user_data["flow"] = secrets.token_hex(3)
         vendor_id = update.effective_user.id
         is_admin = vendor_id in get_admin_ids()
         try:
@@ -220,7 +224,7 @@ class VendorBot:
                 .select("title, original_price, discount_price")
                 .eq("stall_id", stall_id)
                 .order("created_at", desc=True)
-                .limit(30)
+                .limit(RECENT_MEALS_LOOKBACK)
                 .execute()
                 .data or []
             )
@@ -247,10 +251,11 @@ class VendorBot:
         context.user_data["stall_id"] = stall["id"]
         recent = self._recent_meals(stall["id"])
         context.user_data["recent"] = recent
+        flow = context.user_data.get("flow", "")
         keyboard = [
             [InlineKeyboardButton(
                 f"📌 {m['title'][:30]} · ${m['original_price']:.2f} → ${m['discount_price']:.2f}",
-                callback_data=f"recent:{i}",
+                callback_data=f"recent:{flow}:{i}",
             )]
             for i, m in enumerate(recent)
         ]
@@ -271,14 +276,15 @@ class VendorBot:
         query = update.callback_query
         await query.answer()
         recent = context.user_data.get("recent", [])
-        idx = int(query.data.split(":")[1])
-        if not 0 <= idx < len(recent):
+        idx = self._flow_value(context, query.data)
+        if idx is None or not 0 <= idx < len(recent):
             await query.edit_message_text("🍽️ Step 2/5: Please type the meal title.")
             return MEAL_TITLE
         meal = recent[idx]
         context.user_data.update(meal)
         return await self._ask_quantity(
             update,
+            context,
             f"✅ {meal['title']} · ${meal['original_price']:.2f} → ${meal['discount_price']:.2f}\n\n",
         )
 
@@ -298,6 +304,14 @@ class VendorBot:
             parse_mode=ParseMode.MARKDOWN,
         )
         return PRICES
+
+    @staticmethod
+    def _flow_value(context: ContextTypes.DEFAULT_TYPE, data: str) -> int | None:
+        """解析 \"<前缀>:<流程编号>:<数字>\" 形式的 callback_data；不是本次发布流程的按钮返回 None。"""
+        parts = data.split(":")
+        if len(parts) != 3 or parts[1] != context.user_data.get("flow") or not parts[2].isdigit():
+            return None
+        return int(parts[2])
 
     @staticmethod
     def _parse_price(text: str) -> float:
@@ -341,13 +355,14 @@ class VendorBot:
 
         data["original_price"] = original
         if discount is None:
+            flow = data.get("flow", "")
             keyboard = [[
                 InlineKeyboardButton(f"{pct}% off · ${self._discounted(original, pct):.2f}",
-                                     callback_data=f"disc:{pct}")
+                                     callback_data=f"disc:{flow}:{pct}")
                 for pct in DISCOUNT_OPTIONS[:2]
             ], [
                 InlineKeyboardButton(f"{pct}% off · ${self._discounted(original, pct):.2f}",
-                                     callback_data=f"disc:{pct}")
+                                     callback_data=f"disc:{flow}:{pct}")
                 for pct in DISCOUNT_OPTIONS[2:]
             ]]
             await update.message.reply_text(
@@ -358,13 +373,13 @@ class VendorBot:
             return PRICES
 
         data["discount_price"] = discount
-        return await self._ask_quantity(update)
+        return await self._ask_quantity(update, context)
 
     async def pick_discount(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         """Step 3/5 点了折扣按钮。"""
         query = update.callback_query
         await query.answer()
-        pct = int(query.data.split(":")[1])
+        pct = self._flow_value(context, query.data)
         original = context.user_data.get("original_price")
         if pct not in DISCOUNT_OPTIONS or original is None:
             await query.edit_message_text("💰 Step 3/5: Please type the original price, e.g. 6.50")
@@ -373,13 +388,16 @@ class VendorBot:
         discount = self._discounted(original, pct)
         context.user_data["discount_price"] = discount
         return await self._ask_quantity(
-            update, f"💰 ${original:.2f} → ${discount:.2f} ({pct}% off)\n\n"
+            update, context, f"💰 ${original:.2f} → ${discount:.2f} ({pct}% off)\n\n"
         )
 
-    async def _ask_quantity(self, update: Update, prefix: str = "") -> int:
+    async def _ask_quantity(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, prefix: str = ""
+    ) -> int:
         """Step 4/5：问份数，提供常用数字按钮。"""
+        flow = context.user_data.get("flow", "")
         keyboard = [[
-            InlineKeyboardButton(str(n), callback_data=f"qty:{n}") for n in QUANTITY_OPTIONS
+            InlineKeyboardButton(str(n), callback_data=f"qty:{flow}:{n}") for n in QUANTITY_OPTIONS
         ]]
         await self._reply_step(
             update,
@@ -408,9 +426,9 @@ class VendorBot:
         """Step 4/5 点了份数按钮。"""
         query = update.callback_query
         await query.answer()
-        qty = int(query.data.split(":")[1])
+        qty = self._flow_value(context, query.data)
         if qty not in QUANTITY_OPTIONS:
-            return await self._ask_quantity(update)
+            return await self._ask_quantity(update, context)
         context.user_data["quantity"] = qty
         return await self._ask_pickup(update, context, f"📦 {qty} portion(s)\n\n")
 
@@ -430,7 +448,8 @@ class VendorBot:
         """Step 5/5：问取餐时间，提供从现在开始的几个窗口。"""
         windows = self._pickup_windows()
         context.user_data["windows"] = windows
-        keyboard = [[InlineKeyboardButton(f"🕖 {w}", callback_data=f"win:{i}")] for i, w in enumerate(windows)]
+        flow = context.user_data.get("flow", "")
+        keyboard = [[InlineKeyboardButton(f"🕖 {w}", callback_data=f"win:{flow}:{i}")] for i, w in enumerate(windows)]
         await self._reply_step(
             update,
             f"{prefix}🕖 Step 5/5: What's the pickup window?\n"
@@ -455,8 +474,8 @@ class VendorBot:
         query = update.callback_query
         await query.answer()
         windows = context.user_data.get("windows", [])
-        idx = int(query.data.split(":")[1])
-        if not 0 <= idx < len(windows):
+        idx = self._flow_value(context, query.data)
+        if idx is None or not 0 <= idx < len(windows):
             return await self._ask_pickup(update, context)
         return await self._publish(update, context, windows[idx])
 
@@ -895,19 +914,19 @@ def main() -> None:
         states={
             SELECT_STALL: [CallbackQueryHandler(bot.select_stall, pattern=r"^stall:")],
             MEAL_TITLE: [
-                CallbackQueryHandler(bot.pick_recent, pattern=r"^recent:\d+$"),
+                CallbackQueryHandler(bot.pick_recent, pattern=r"^recent:\w+:\d+$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, bot.meal_title),
             ],
             PRICES: [
-                CallbackQueryHandler(bot.pick_discount, pattern=r"^disc:\d+$"),
+                CallbackQueryHandler(bot.pick_discount, pattern=r"^disc:\w+:\d+$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, bot.prices),
             ],
             QUANTITY: [
-                CallbackQueryHandler(bot.pick_quantity, pattern=r"^qty:\d+$"),
+                CallbackQueryHandler(bot.pick_quantity, pattern=r"^qty:\w+:\d+$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, bot.quantity),
             ],
             PICKUP_WINDOW: [
-                CallbackQueryHandler(bot.pick_window, pattern=r"^win:\d+$"),
+                CallbackQueryHandler(bot.pick_window, pattern=r"^win:\w+:\d+$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, bot.pickup_window),
             ],
             VERIFY_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot.verify_code)],
