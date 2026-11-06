@@ -68,7 +68,7 @@ def eat_by(listing_created_at: str, reserved_at: datetime, stall: dict | None) -
     return start + EAT_WITHIN
 
 
-def fmt_eat_by(dt: datetime) -> str:
+def fmt_sg_time(dt: datetime) -> str:
     """按新加坡时间显示，例如 '11:00 PM'；不是今天的再加上日期，例如 'Nov 5, 11:00 PM'。"""
     local = dt.astimezone(SG_TZ)
     clock = local.strftime("%I:%M %p").lstrip("0")

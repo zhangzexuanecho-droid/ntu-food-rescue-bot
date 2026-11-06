@@ -26,7 +26,7 @@ from telegram.ext import (
 
 from common import (
     eat_by,
-    fmt_eat_by,
+    fmt_sg_time,
     get_admin_ids,
     get_bot_token,
     get_supabase,
@@ -249,7 +249,7 @@ class StudentBot:
             f"🍽️ {listing['title']}\n"
             f"📍 {stall.get('stall_name', 'N/A')} — {stall.get('canteen_location', 'N/A')}\n"
             f"🕖 Pickup: {listing.get('pickup_time') or 'TBA'}\n"
-            f"⏰ Please eat by {fmt_eat_by(deadline)} (food safety)\n\n"
+            f"⏰ Please eat by {fmt_sg_time(deadline)} (food safety)\n\n"
             f"🎟️ Your Claim Code: {claim_code}\n\n"
             "Show this code at the stall to collect your meal. Enjoy!"
         )
@@ -369,7 +369,7 @@ class StudentBot:
                 f"{i}. {listing.get('title', 'N/A')}\n"
                 f"   🎟️ {r['claim_code']} | 📍 {stall.get('canteen_location', 'N/A')}\n"
                 f"   🕖 {listing.get('pickup_time') or 'TBA'} | Status: {r['status']}\n"
-                f"   ⏰ Eat by {fmt_eat_by(deadline)}\n"
+                f"   ⏰ Eat by {fmt_sg_time(deadline)}\n"
             )
 
         await query.edit_message_text(
