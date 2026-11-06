@@ -63,6 +63,12 @@ Existing projects created from an older `schema.sql` need these, run once in the
 ```sql
 -- 2026-11: stop-selling flag (auto-release must not restock stopped listings)
 alter table public.listings add column if not exists stopped boolean not null default false;
+
+-- 2026-11: how many portions were originally listed (quantity changes with reservations / stop selling)
+alter table public.listings add column if not exists initial_quantity integer check (initial_quantity >= 0);
+update public.listings l set initial_quantity = l.quantity + (
+    select count(*) from public.reservations r where r.listing_id = l.id and r.status <> 'cancelled'
+) where l.initial_quantity is null;
 ```
 
 ## Run 24/7 on a Linux machine

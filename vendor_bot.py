@@ -488,6 +488,8 @@ class VendorBot:
             "original_price": context.user_data["original_price"],
             "discount_price": context.user_data["discount_price"],
             "quantity": context.user_data["quantity"],
+            # quantity 会随预订、下架变化，这里另存最初挂了几份（My Listings 的 Listed、论文的 listed vs collected）
+            "initial_quantity": context.user_data["quantity"],
             "pickup_time": pickup,
         }
         try:
@@ -699,7 +701,7 @@ class VendorBot:
         「可见」与学生端一致：SAME_DAY_ONLY 打开时只看今天发布的（demo 摊位除外），卖完的也列出来。
         """
         q = self.supabase.table("listings").select(
-            "id, title, quantity, pickup_time, created_at, stall_id, stopped, "
+            "id, title, quantity, initial_quantity, pickup_time, created_at, stall_id, stopped, "
             "stalls(stall_name, vendor_telegram_id)"
         )
         if not is_admin:
@@ -729,8 +731,12 @@ class VendorBot:
             statuses = [r["status"] for r in reservations if r["listing_id"] == item["id"]]
             item["reserved"] = statuses.count("pending")
             item["collected"] = statuses.count("completed")
-            # 没有存最初挂了几份：剩余 + 已订（含已领）反推出来
-            item["listed"] = item["quantity"] + item["reserved"] + item["collected"]
+            # 最初挂了几份：新 listing 发布时存了 initial_quantity；更早的旧数据没有，用剩余 + 已订（含已领）反推
+            # （反推在下架后会偏小，因为下架把剩余份数清零了）
+            item["listed"] = (
+                item["initial_quantity"] if item.get("initial_quantity") is not None
+                else item["quantity"] + item["reserved"] + item["collected"]
+            )
         return listings
 
     async def my_listings(

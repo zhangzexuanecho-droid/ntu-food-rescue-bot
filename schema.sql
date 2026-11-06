@@ -26,6 +26,8 @@ create table if not exists public.listings (
     quantity       integer not null default 0 check (quantity >= 0),
     -- 商家提前下架后为 true：超时释放、预订失败回补库存都不会再把它放出来
     stopped        boolean not null default false,
+    -- 发布时挂了几份（quantity 会随预订、下架变化），用于统计 listed vs collected
+    initial_quantity integer check (initial_quantity >= 0),
     pickup_time    text,
     -- 注意：原需求为 timestamp，此处改用 timestamptz 以正确存储时区信息
     -- （Supabase 官方约定）。如必须使用 timestamp，把类型改回即可。
@@ -61,21 +63,22 @@ insert into public.stalls (stall_name, canteen_location) values
     ('Mini Wok @ Canteen 11', 'Canteen 11');
 
 -- 每个摊位一条示例 listing（通过 stall_name 反查 uuid）
-insert into public.listings (stall_id, title, original_price, discount_price, quantity, pickup_time)
-select id, 'Grilled Chicken Chop Rice', 7.00, 3.50, 5, '5:00 PM - 5:30 PM'
+-- 鸡扒饭挂了 5 份、下面有 1 条示例预订，所以剩余 4 份
+insert into public.listings (stall_id, title, original_price, discount_price, quantity, initial_quantity, pickup_time)
+select id, 'Grilled Chicken Chop Rice', 7.00, 3.50, 4, 5, '7:30 PM - 8:15 PM'
 from public.stalls where stall_name = 'Western Food @ Canteen 2';
 
-insert into public.listings (stall_id, title, original_price, discount_price, quantity, pickup_time)
-select id, 'Steamed Chicken Rice Set', 4.80, 2.00, 10, '4:30 PM - 5:30 PM'
+insert into public.listings (stall_id, title, original_price, discount_price, quantity, initial_quantity, pickup_time)
+select id, 'Steamed Chicken Rice Set', 4.80, 2.00, 10, 10, '7:45 PM - 8:30 PM'
 from public.stalls where stall_name = 'Chicken Rice @ North Spine';
 
-insert into public.listings (stall_id, title, original_price, discount_price, quantity, pickup_time)
-select id, 'Beef Hor Fun', 5.50, 2.80, 3, '5:30 PM - 6:00 PM'
+insert into public.listings (stall_id, title, original_price, discount_price, quantity, initial_quantity, pickup_time)
+select id, 'Beef Hor Fun', 5.50, 2.80, 3, 3, '8:00 PM - 8:30 PM'
 from public.stalls where stall_name = 'Mini Wok @ Canteen 11';
 
 -- 示例预订记录（claim_code 唯一，供摊位核销使用）
 insert into public.reservations (listing_id, student_telegram_id, claim_code)
-select id, 123456789, 'CC-8F3K2A'
+select id, 123456789, 'K7Q2XM'
 from public.listings where title = 'Grilled Chicken Chop Rice';
 
 -- -------------------------------------------------------------

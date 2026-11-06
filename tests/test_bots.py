@@ -437,6 +437,13 @@ async def my_listings_checks():
     rows = u.callback_query.edit_message_text.call_args.kwargs["reply_markup"].inline_keyboard
     assert listings["today1"]["quantity"] == 0 and listings["today1"]["stopped"] is True
     assert text.startswith("🛑 Stopped selling Chicken Rice Set") and "· 🛑 Stopped" in text
+    # without initial_quantity (old rows) Listed shrinks after stop; with it, Listed stays the original count
+    assert "Listed 2 · 🟡 Reserved 1 · ✅ Collected 1 · Left 0" in text, text
+    listings["today1"]["initial_quantity"] = 4
+    u2 = msg_update("/listings", 101)
+    await vb.my_listings(u2, ctx())
+    assert "Listed 4 · 🟡 Reserved 1 · ✅ Collected 1 · Left 0" in u2.message.reply_text.call_args.args[0]
+    print("✓ initial_quantity keeps Listed correct after stop")
     assert "Left 0" in text and not any("Chicken Rice Set" in b.text for row in rows for b in row)
     assert u.callback_query.answer.await_count == 1
     u = cb_update("browse", 50)
@@ -496,6 +503,7 @@ async def publish_checks():
     row = new()[-1]
     assert (row["title"], row["original_price"], row["discount_price"], row["quantity"], row["pickup_time"]) == \
         ("Chicken Rice Set", 4.8, 2.0, 5, windows[1]), row
+    assert row["initial_quantity"] == 5
     assert "Listing published" in u.callback_query.edit_message_text.call_args.args[0]
     print("✓ quantity + pickup buttons publish:", windows[1])
 
