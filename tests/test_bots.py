@@ -2,8 +2,8 @@
 
 No Telegram or Supabase connection needed. Put this file at tests/test_bots.py and run from the repo root:
 
-    uv run python tests/test_bots.py                      # SAME_DAY_ONLY off (demo mode): 5 + 6 eat-by + 6 my-listings scenarios
-    SAME_DAY_ONLY=true uv run python tests/test_bots.py   # SAME_DAY_ONLY on: 16 + 6 eat-by + 6 my-listings scenarios
+    uv run python tests/test_bots.py                      # SAME_DAY_ONLY off (demo mode): 5 + 6 eat-by + 6 my-listings + 5 publish scenarios
+    SAME_DAY_ONLY=true uv run python tests/test_bots.py   # SAME_DAY_ONLY on: 16 + 6 eat-by + 6 my-listings + 5 publish scenarios
 """
 
 import asyncio
@@ -450,10 +450,92 @@ async def my_listings_checks():
     print("\nALL PASSED (my listings)")
 
 
+async def publish_checks():
+    """Publish flow quick options: recent meals, discount %, quantity and pickup-window buttons. Both modes."""
+    db = seed()
+    student_bot.get_supabase = lambda: db
+    vendor_bot.get_supabase = lambda: db
+    vb = vendor_bot.VendorBot()
+    new = lambda: [l for l in db.tables["listings"] if l["id"] not in {"today1", "today2", "old"}]
+
+    def buttons(u):
+        call = u.callback_query.edit_message_text.call_args if u.callback_query else u.message.reply_text.call_args
+        markup = call.kwargs.get("reply_markup")
+        return [(b.text, b.callback_data) for row in markup.inline_keyboard for b in row] if markup else []
+
+    assert vb._discounted(6.5, 30) == 4.6 and vb._discounted(5, 50) == 2.5
+    print("✓ discount rounds to 10 cents")
+
+    # tap path: recent meal -> quantity button -> pickup window button
+    c = ctx()
+    u = cb_update("add_meal", 101)
+    assert await vb.start_add_meal(u, c) == vendor_bot.MEAL_TITLE
+    recent = {text: data for text, data in buttons(u)}
+    label = next(t for t in recent if "Chicken Rice Set" in t)
+    assert "$4.80 → $2.00" in label and any("Stale Curry" in t for t in recent)
+    assert await vb.pick_recent(cb_update("recent:99", 101), c) == vendor_bot.MEAL_TITLE  # forged index
+    u = cb_update(recent[label], 101)
+    assert await vb.pick_recent(u, c) == vendor_bot.QUANTITY
+    assert "Step 4/5" in u.callback_query.edit_message_text.call_args.args[0]
+    assert [t for t, _ in buttons(u)] == ["1", "2", "3", "5", "10"]
+    print("✓ recent meal fills title + prices and skips to step 4")
+
+    assert await vb.pick_quantity(cb_update("qty:7", 101), c) == vendor_bot.QUANTITY  # not an option
+    u = cb_update("qty:5", 101)
+    assert await vb.pick_quantity(u, c) == vendor_bot.PICKUP_WINDOW
+    windows = [t.removeprefix("🕖 ") for t, _ in buttons(u)]
+    assert len(windows) == 3 and len(set(windows)) == 3 and all(" - " in w for w in windows), windows
+    assert await vb.pick_window(cb_update("win:5", 101), c) == vendor_bot.PICKUP_WINDOW  # forged index
+    u = cb_update("win:1", 101)
+    assert await vb.pick_window(u, c) == ConversationHandler.END
+    row = new()[-1]
+    assert (row["title"], row["original_price"], row["discount_price"], row["quantity"], row["pickup_time"]) == \
+        ("Chicken Rice Set", 4.8, 2.0, 5, windows[1]), row
+    assert "Listing published" in u.callback_query.edit_message_text.call_args.args[0]
+    print("✓ quantity + pickup buttons publish:", windows[1])
+
+    # typed path: title -> original price -> discount button -> typed quantity -> typed pickup
+    c = ctx()
+    await vb.start_add_meal(cb_update("add_meal", 101), c)
+    assert await vb.meal_title(msg_update("Nasi Lemak", 101), c) == vendor_bot.PRICES
+    u = msg_update("5.00", 101)
+    assert await vb.prices(u, c) == vendor_bot.PRICES
+    assert ("50% off · $2.50", "disc:50") in buttons(u), buttons(u)
+    assert await vb.pick_discount(cb_update("disc:45", 101), c) == vendor_bot.PRICES  # not an option
+    assert "original_price" not in c.user_data
+    await vb.prices(msg_update("5.00", 101), c)
+    assert await vb.pick_discount(cb_update("disc:50", 101), c) == vendor_bot.QUANTITY
+    assert await vb.quantity(msg_update("3", 101), c) == vendor_bot.PICKUP_WINDOW
+    assert await vb.pickup_window(msg_update("7:30 PM - 8:30 PM", 101), c) == ConversationHandler.END
+    row = new()[-1]
+    assert (row["title"], row["discount_price"], row["quantity"], row["pickup_time"]) == \
+        ("Nasi Lemak", 2.5, 3, "7:30 PM - 8:30 PM"), row
+    print("✓ typed title + discount button + typed quantity/pickup")
+
+    # typed discounted price, invalid input, and the old one-line format
+    c = ctx()
+    await vb.start_add_meal(cb_update("add_meal", 101), c)
+    await vb.meal_title(msg_update("Mee Goreng", 101), c)
+    assert await vb.prices(msg_update("6, 9", 101), c) == vendor_bot.PRICES
+    assert await vb.prices(msg_update("abc", 101), c) == vendor_bot.PRICES
+    await vb.prices(msg_update("5", 101), c)
+    assert await vb.prices(msg_update("6", 101), c) == vendor_bot.PRICES  # discount above original
+    assert await vb.prices(msg_update("1.80", 101), c) == vendor_bot.QUANTITY
+    assert c.user_data["discount_price"] == 1.8
+    c = ctx()
+    await vb.start_add_meal(cb_update("add_meal", 101), c)
+    await vb.meal_title(msg_update("Mee Goreng", 101), c)
+    assert await vb.prices(msg_update("6.50, 3.00", 101), c) == vendor_bot.QUANTITY
+    print("✓ typed discount, invalid prices re-asked, 'orig, disc' still works")
+
+    print("\nALL PASSED (publish)")
+
+
 async def run():
     await (main() if common.same_day_only() else demo_mode())
     await eat_by_checks()
     await my_listings_checks()
+    await publish_checks()
 
 
 asyncio.run(run())
