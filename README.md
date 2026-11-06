@@ -5,13 +5,13 @@ A campus version of Too Good To Go for NTU: food stalls list surplus meals at a 
 ## Architecture
 
 - **Two Telegram bots** built with `python-telegram-bot` v22 (async):
-  - `student_bot.py` — browse today's available meals (5 per page), reserve with one tap (1 meal per student per day), view today's reservations
+  - `student_bot.py` — browse available meals (5 per page), reserve with one tap (1 meal per student per day), view my reservations
   - `vendor_bot.py` — publish surplus meals via a five-step wizard (stall → title → prices → quantity → pickup window)
     and verify a student's claim code at pickup (button or `/verify CODE`), which marks the reservation as completed
 - **Supabase (PostgreSQL)** — three tables: `stalls`, `listings`, `reservations` (`schema.sql`)
 - **Role-based access** — each vendor account is linked to its own stall via `vendor_telegram_id`; admin Telegram IDs (configured in `.env`) can manage all stalls
 - Reservations decrement stock with a compare-and-swap update (`WHERE quantity = <value just read>`, retried on conflict), so concurrent reservations can't oversell; if saving the reservation fails, the portion is put back. Unique 6-character claim codes for collection
-- **Same-day only** — only listings published today (Singapore time) can be browsed or reserved, and only today's reservations can be collected; earlier ones expire
+- **Same-day only (optional)** — with `SAME_DAY_ONLY=true` in `.env`, only listings published today (Singapore time) can be browsed or reserved, and only today's reservations can be collected; earlier ones expire. Off by default so demo data stays visible; turn it on for a real pilot
 - **Daily limit** — each student can reserve 1 meal per day (pending or collected); admin Telegram IDs are exempt so the bots can be tested and demoed
 
 ## Project layout
@@ -94,6 +94,7 @@ TELEGRAM_VENDOR_BOT_TOKEN=<from BotFather>
 SUPABASE_URL=https://<project-ref>.supabase.co
 SUPABASE_KEY=<service_role key>
 VENDOR_ADMIN_TELEGRAM_IDS=123456789,987654321
+SAME_DAY_ONLY=            # true for a real pilot; empty/false for the demo
 ```
 
 > ⚠️ Never commit `.env` — it contains live secrets. It is already covered by `.gitignore`.

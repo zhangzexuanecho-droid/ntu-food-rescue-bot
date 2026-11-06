@@ -30,8 +30,8 @@ from common import (
     get_admin_ids,
     get_bot_token,
     get_supabase,
+    only_today,
     schedule_db_keepalive,
-    today_start_utc,
 )
 
 logger = logging.getLogger(__name__)
@@ -421,19 +421,18 @@ class VendorBot:
         if reservation["status"] != "pending":
             return "cancelled", reservation
 
-        # 条件更新：只有今天的 pending 预订才能核销。WHERE 带上 status = 'pending'，
-        # 同一个码被重复提交时只有第一次生效，不会被领两次
-        updated = (
+        # 条件更新：WHERE 带上 status = 'pending'，同一个码被重复提交时只有第一次生效，不会被领两次；
+        # SAME_DAY_ONLY 打开时再加上「今天的预订」
+        updated = only_today(
             self.supabase.table("reservations")
             .update({"status": "completed"})
             .eq("id", reservation["id"])
             .eq("status", "pending")
-            .gte("created_at", today_start_utc())
-            .execute()
-        )
+        ).execute()
         if updated.data:
             return "ok", reservation
-        # PTB 逐个处理 update，期间唯一可能改动 status 的是本 bot 自己，所以没更新到就是过期了
+        # PTB 逐个处理 update，期间唯一可能改动 status 的是本 bot 自己，
+        # 所以没更新到只可能是 SAME_DAY_ONLY 打开且预订不是今天的，即已过期
         return "expired", reservation
 
     async def cancel_add(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:

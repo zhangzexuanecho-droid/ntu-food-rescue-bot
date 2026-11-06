@@ -32,8 +32,21 @@ logger = logging.getLogger(__name__)
 # 每个 bot 每 6 小时查一次库，没人使用 bot 时数据库也保持活跃。
 KEEPALIVE_INTERVAL = timedelta(hours=6)
 
-# 「今天」按新加坡时间算：只有当天发布的餐品可以浏览、预订、核销（食品安全：只卖当天做的食物）
+# 「今天」按新加坡时间算（每人每天限订一份、SAME_DAY_ONLY 都用它）
 SG_TZ = ZoneInfo("Asia/Singapore")
+
+
+def same_day_only() -> bool:
+    """SAME_DAY_ONLY=true 时，只有当天发布的餐品可以浏览、预订、核销（食品安全：只卖当天做的食物）。
+
+    默认关闭：demo 阶段要能看到示例数据和之前发布的 listing；正式 pilot 时在 .env 里打开。
+    """
+    return os.getenv("SAME_DAY_ONLY", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def only_today(query):
+    """SAME_DAY_ONLY 打开时给查询加上 created_at >= 今天 00:00（新加坡时间），否则原样返回。"""
+    return query.gte("created_at", today_start_utc()) if same_day_only() else query
 
 
 def today_start_utc() -> str:

@@ -27,6 +27,7 @@ from common import (
     get_admin_ids,
     get_bot_token,
     get_supabase,
+    only_today,
     schedule_db_keepalive,
     today_start_utc,
 )
@@ -101,9 +102,9 @@ class StudentBot:
     # ------------------------------------------------------------------
 
     async def browse(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """查询今天发布且 quantity > 0 的 listings（join stalls），分页展示并附 Reserve 按钮。
+        """查询 quantity > 0 的 listings（join stalls），分页展示并附 Reserve 按钮。
 
-        之前日子没卖完的 listing 不再显示：只卖当天做的食物。
+        SAME_DAY_ONLY 打开时只显示今天发布的：之前日子没卖完的不再显示，只卖当天做的食物。
 
         callback_data 为 "browse"（第一页）或 "browse:<页码>"（翻页，页码从 0 开始）。
         """
@@ -113,17 +114,15 @@ class StudentBot:
         page = int(page_arg) if page_arg.isdigit() else 0
 
         try:
-            res = (
+            available = (
                 self.supabase.table("listings")
                 .select(
                     "id, title, original_price, discount_price, quantity, "
                     "pickup_time, stalls(stall_name, canteen_location)"
                 )
                 .gt("quantity", 0)
-                .gte("created_at", today_start_utc())
-                .order("created_at", desc=True)
-                .execute()
             )
+            res = only_today(available).order("created_at", desc=True).execute()
             items = res.data or []
         except Exception as exc:
             logger.error("查询 listings 失败: %s", exc)
@@ -177,7 +176,7 @@ class StudentBot:
     async def reserve(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """
         处理 Reserve Now：
-          1. 取最新详情（列表页数据可能已过期；只接受今天发布的 listing）
+          1. 取最新详情（列表页数据可能已过期；SAME_DAY_ONLY 打开时只接受今天发布的 listing）
           2. 每个学生每天限订一份（管理员不受限，方便测试和演示）
           3. CAS 扣减一份库存，售罄则弹窗提示
           4. 写入 reservations（含 6 位随机 claim_code），写入失败则回补库存
@@ -194,13 +193,11 @@ class StudentBot:
         user = query.from_user
 
         try:
-            res = (
+            res = only_today(
                 self.supabase.table("listings")
                 .select("id, title, quantity, pickup_time, stalls(stall_name, canteen_location)")
                 .eq("id", listing_id)
-                .gte("created_at", today_start_utc())
-                .execute()
-            )
+            ).execute()
             if not res.data:
                 await query.answer("😔 This listing is no longer available.", show_alert=True)
                 return
@@ -312,16 +309,16 @@ class StudentBot:
     # ------------------------------------------------------------------
 
     async def my_reservations(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """查询当前用户今天 status = 'pending' 的预订（join listings → stalls）。
+        """查询当前用户 status = 'pending' 的预订（join listings → stalls）。
 
-        之前日子没领的预订已过期，不再显示；已核销（completed）的也不显示。
+        已核销（completed）的不显示；SAME_DAY_ONLY 打开时，之前日子没领的预订已过期，也不显示。
         """
         query = update.callback_query
         await query.answer()
         user = query.from_user
 
         try:
-            res = (
+            pending = (
                 self.supabase.table("reservations")
                 .select(
                     "claim_code, status, created_at, "
@@ -329,10 +326,8 @@ class StudentBot:
                 )
                 .eq("student_telegram_id", user.id)
                 .eq("status", "pending")
-                .gte("created_at", today_start_utc())
-                .order("created_at", desc=True)
-                .execute()
             )
+            res = only_today(pending).order("created_at", desc=True).execute()
             rows = res.data or []
         except Exception as exc:
             logger.error("查询预订失败 telegram_id=%s: %s", user.id, exc)
@@ -340,7 +335,7 @@ class StudentBot:
             return
 
         if not rows:
-            await self._render_menu(query, "📋 You have no pending reservations today.\n\nGo rescue a meal! 🍱")
+            await self._render_menu(query, "📋 You have no pending reservations.\n\nGo rescue a meal! 🍱")
             return
 
         lines = ["📋 Your Pending Reservations\n"]
